@@ -11,7 +11,7 @@
 //! raw JSON call.
 
 use serde::{Serialize, de::DeserializeOwned};
-use std::{collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};
+use std::{any::Any, collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};
 
 use crate::{
     BoxError, BoxPinFut, Function, Json, Resource, ToolOutput, context::BaseContext,
@@ -115,6 +115,7 @@ where
                 output,
                 artifacts: result.artifacts,
                 usage: result.usage,
+                tools_usage: result.tools_usage,
             })
         }
     }
@@ -128,6 +129,10 @@ pub trait DynTool<C>: Send + Sync
 where
     C: BaseContext + Send + Sync,
 {
+    fn as_any(&self) -> &(dyn Any + Send + Sync);
+
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
+
     fn name(&self) -> String;
 
     fn definition(&self) -> FunctionDefinition;
@@ -144,6 +149,30 @@ where
     ) -> BoxPinFut<Result<ToolOutput<Json>, BoxError>>;
 }
 
+impl<C> dyn DynTool<C>
+where
+    C: BaseContext + Send + Sync + 'static,
+{
+    /// Returns the inner concrete tool type when it matches `T`.
+    pub fn downcast_ref<T>(&self) -> Option<&T>
+    where
+        T: Tool<C> + 'static,
+    {
+        self.as_any().downcast_ref::<T>()
+    }
+
+    /// Returns the inner concrete tool when it matches `T`.
+    pub fn downcast<T>(self: Arc<Self>) -> Result<Arc<T>, Arc<Self>>
+    where
+        T: Tool<C> + 'static,
+    {
+        match self.clone().into_any().downcast::<T>() {
+            Ok(tool) => Ok(tool),
+            Err(_) => Err(self),
+        }
+    }
+}
+
 /// Adapter that exposes a concrete [`Tool`] through [`DynTool`].
 struct ToolWrapper<T, C>(Arc<T>, PhantomData<C>)
 where
@@ -155,6 +184,14 @@ where
     T: Tool<C> + 'static,
     C: BaseContext + Send + Sync + 'static,
 {
+    fn as_any(&self) -> &(dyn Any + Send + Sync) {
+        self.0.as_ref()
+    }
+
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self.0.clone()
+    }
+
     fn name(&self) -> String {
         self.0.name()
     }
@@ -315,5 +352,412 @@ where
     /// Returns a tool by lowercase name.
     pub fn get_lowercase(&self, lowercase_name: &str) -> Option<Arc<dyn DynTool<C>>> {
         self.set.get(lowercase_name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candid::{CandidType, Principal, utils::ArgumentEncoder};
+    use serde_json::json;
+    use std::{sync::Arc, time::Duration};
+
+    use crate::{
+        CacheExpiry, CacheFeatures, CancellationToken, HttpFeatures, KeysFeatures, ObjectMeta,
+        Path, PutMode, PutResult, RequestMeta, StateFeatures, StoreFeatures, ToolInput,
+    };
+
+    #[derive(Clone)]
+    struct TestContext {
+        engine_id: Principal,
+        caller: Principal,
+        meta: RequestMeta,
+        cancellation_token: CancellationToken,
+    }
+
+    impl Default for TestContext {
+        fn default() -> Self {
+            Self {
+                engine_id: Principal::management_canister(),
+                caller: Principal::anonymous(),
+                meta: RequestMeta::default(),
+                cancellation_token: CancellationToken::new(),
+            }
+        }
+    }
+
+    impl StateFeatures for TestContext {
+        fn engine_id(&self) -> &Principal {
+            &self.engine_id
+        }
+
+        fn engine_name(&self) -> &str {
+            "test-engine"
+        }
+
+        fn caller(&self) -> &Principal {
+            &self.caller
+        }
+
+        fn meta(&self) -> &RequestMeta {
+            &self.meta
+        }
+
+        fn cancellation_token(&self) -> CancellationToken {
+            self.cancellation_token.clone()
+        }
+
+        fn time_elapsed(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    impl KeysFeatures for TestContext {
+        async fn a256gcm_key(&self, _derivation_path: Vec<Vec<u8>>) -> Result<[u8; 32], BoxError> {
+            Ok([0; 32])
+        }
+
+        async fn ed25519_sign_message(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message: &[u8],
+        ) -> Result<[u8; 64], BoxError> {
+            Ok([0; 64])
+        }
+
+        async fn ed25519_verify(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message: &[u8],
+            _signature: &[u8],
+        ) -> Result<(), BoxError> {
+            Ok(())
+        }
+
+        async fn ed25519_public_key(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+        ) -> Result<[u8; 32], BoxError> {
+            Ok([0; 32])
+        }
+
+        async fn secp256k1_sign_message_bip340(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message: &[u8],
+        ) -> Result<[u8; 64], BoxError> {
+            Ok([0; 64])
+        }
+
+        async fn secp256k1_verify_bip340(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message: &[u8],
+            _signature: &[u8],
+        ) -> Result<(), BoxError> {
+            Ok(())
+        }
+
+        async fn secp256k1_sign_message_ecdsa(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message: &[u8],
+        ) -> Result<[u8; 64], BoxError> {
+            Ok([0; 64])
+        }
+
+        async fn secp256k1_sign_digest_ecdsa(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message_hash: &[u8],
+        ) -> Result<[u8; 64], BoxError> {
+            Ok([0; 64])
+        }
+
+        async fn secp256k1_verify_ecdsa(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message_hash: &[u8],
+            _signature: &[u8],
+        ) -> Result<(), BoxError> {
+            Ok(())
+        }
+
+        async fn secp256k1_public_key(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+        ) -> Result<[u8; 33], BoxError> {
+            Ok([0; 33])
+        }
+    }
+
+    impl StoreFeatures for TestContext {
+        async fn store_get(&self, _path: &Path) -> Result<(bytes::Bytes, ObjectMeta), BoxError> {
+            Err("not implemented".into())
+        }
+
+        async fn store_list(
+            &self,
+            _prefix: Option<&Path>,
+            _offset: &Path,
+        ) -> Result<Vec<ObjectMeta>, BoxError> {
+            Ok(Vec::new())
+        }
+
+        async fn store_put(
+            &self,
+            _path: &Path,
+            _mode: PutMode,
+            _value: bytes::Bytes,
+        ) -> Result<PutResult, BoxError> {
+            Err("not implemented".into())
+        }
+
+        async fn store_rename_if_not_exists(
+            &self,
+            _from: &Path,
+            _to: &Path,
+        ) -> Result<(), BoxError> {
+            Err("not implemented".into())
+        }
+
+        async fn store_delete(&self, _path: &Path) -> Result<(), BoxError> {
+            Ok(())
+        }
+    }
+
+    impl CacheFeatures for TestContext {
+        fn cache_contains(&self, _key: &str) -> bool {
+            false
+        }
+
+        async fn cache_get<T>(&self, _key: &str) -> Result<T, BoxError>
+        where
+            T: DeserializeOwned,
+        {
+            Err("not implemented".into())
+        }
+
+        async fn cache_get_with<T, F>(&self, _key: &str, _init: F) -> Result<T, BoxError>
+        where
+            T: Sized + DeserializeOwned + Serialize + Send,
+            F: Future<Output = Result<(T, Option<CacheExpiry>), BoxError>> + Send + 'static,
+        {
+            Err("not implemented".into())
+        }
+
+        async fn cache_set<T>(&self, _key: &str, _val: (T, Option<CacheExpiry>))
+        where
+            T: Sized + Serialize + Send,
+        {
+        }
+
+        async fn cache_set_if_not_exists<T>(
+            &self,
+            _key: &str,
+            _val: (T, Option<CacheExpiry>),
+        ) -> bool
+        where
+            T: Sized + Serialize + Send,
+        {
+            false
+        }
+
+        async fn cache_delete(&self, _key: &str) -> bool {
+            false
+        }
+
+        fn cache_raw_iter(
+            &self,
+        ) -> impl Iterator<Item = (Arc<String>, Arc<(bytes::Bytes, Option<CacheExpiry>)>)> {
+            std::iter::empty()
+        }
+    }
+
+    impl HttpFeatures for TestContext {
+        async fn https_call(
+            &self,
+            _url: &str,
+            _method: http::Method,
+            _headers: Option<http::HeaderMap>,
+            _body: Option<Vec<u8>>,
+        ) -> Result<reqwest::Response, BoxError> {
+            Err("not implemented".into())
+        }
+
+        async fn https_signed_call(
+            &self,
+            _url: &str,
+            _method: http::Method,
+            _message_digest: [u8; 32],
+            _headers: Option<http::HeaderMap>,
+            _body: Option<Vec<u8>>,
+        ) -> Result<reqwest::Response, BoxError> {
+            Err("not implemented".into())
+        }
+
+        async fn https_signed_rpc<T>(
+            &self,
+            _endpoint: &str,
+            _method: &str,
+            _args: impl Serialize + Send,
+        ) -> Result<T, BoxError>
+        where
+            T: DeserializeOwned,
+        {
+            Err("not implemented".into())
+        }
+    }
+
+    impl crate::CanisterCaller for TestContext {
+        async fn canister_query<In, Out>(
+            &self,
+            _canister: &Principal,
+            _method: &str,
+            _args: In,
+        ) -> Result<Out, BoxError>
+        where
+            In: ArgumentEncoder + Send,
+            Out: CandidType + for<'a> candid::Deserialize<'a>,
+        {
+            Err("not implemented".into())
+        }
+
+        async fn canister_update<In, Out>(
+            &self,
+            _canister: &Principal,
+            _method: &str,
+            _args: In,
+        ) -> Result<Out, BoxError>
+        where
+            In: ArgumentEncoder + Send,
+            Out: CandidType + for<'a> candid::Deserialize<'a>,
+        {
+            Err("not implemented".into())
+        }
+    }
+
+    impl BaseContext for TestContext {
+        async fn remote_tool_call(
+            &self,
+            _endpoint: &str,
+            _args: ToolInput<Json>,
+        ) -> Result<ToolOutput<Json>, BoxError> {
+            Err("not implemented".into())
+        }
+    }
+
+    struct ExampleTool {
+        id: usize,
+    }
+
+    struct OtherTool;
+
+    impl Tool<TestContext> for ExampleTool {
+        type Args = ();
+        type Output = String;
+
+        fn name(&self) -> String {
+            "example_tool".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Example tool used for downcast tests".to_string()
+        }
+
+        fn definition(&self) -> FunctionDefinition {
+            FunctionDefinition {
+                name: self.name(),
+                description: self.description(),
+                parameters: json!({"type": "object"}),
+                strict: Some(true),
+            }
+        }
+
+        async fn call(
+            &self,
+            _ctx: TestContext,
+            _args: Self::Args,
+            _resources: Vec<Resource>,
+        ) -> Result<ToolOutput<Self::Output>, BoxError> {
+            Ok(ToolOutput::new(self.id.to_string()))
+        }
+    }
+
+    impl Tool<TestContext> for OtherTool {
+        type Args = ();
+        type Output = String;
+
+        fn name(&self) -> String {
+            "other_tool".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Other tool used for downcast tests".to_string()
+        }
+
+        fn definition(&self) -> FunctionDefinition {
+            FunctionDefinition {
+                name: self.name(),
+                description: self.description(),
+                parameters: json!({"type": "object"}),
+                strict: Some(true),
+            }
+        }
+
+        async fn call(
+            &self,
+            _ctx: TestContext,
+            _args: Self::Args,
+            _resources: Vec<Resource>,
+        ) -> Result<ToolOutput<Self::Output>, BoxError> {
+            Ok(ToolOutput::new("other".to_string()))
+        }
+    }
+
+    #[test]
+    fn dyn_tool_downcast_ref_returns_inner_tool() {
+        let tool = Arc::new(ExampleTool { id: 7 });
+        let mut tool_set = ToolSet::<TestContext>::new();
+        tool_set.add(tool).unwrap();
+
+        let dyn_tool = tool_set.get("example_tool").unwrap();
+        let concrete = dyn_tool.downcast_ref::<ExampleTool>().unwrap();
+
+        assert_eq!(concrete.id, 7);
+        assert!(dyn_tool.downcast_ref::<OtherTool>().is_none());
+    }
+
+    #[test]
+    fn dyn_tool_downcast_returns_original_arc() {
+        let tool = Arc::new(ExampleTool { id: 9 });
+        let mut tool_set = ToolSet::<TestContext>::new();
+        tool_set.add(tool.clone()).unwrap();
+
+        let dyn_tool = tool_set.get("example_tool").unwrap();
+        let concrete = match dyn_tool.downcast::<ExampleTool>() {
+            Ok(tool) => tool,
+            Err(_) => panic!("expected downcast to ExampleTool to succeed"),
+        };
+
+        assert_eq!(concrete.id, 9);
+        assert!(Arc::ptr_eq(&concrete, &tool));
+    }
+
+    #[test]
+    fn dyn_tool_downcast_mismatch_returns_original_arc() {
+        let tool = Arc::new(ExampleTool { id: 11 });
+        let mut tool_set = ToolSet::<TestContext>::new();
+        tool_set.add(tool).unwrap();
+
+        let dyn_tool = tool_set.get("example_tool").unwrap();
+        let original = dyn_tool.clone();
+        let err = match dyn_tool.downcast::<OtherTool>() {
+            Ok(_) => panic!("expected downcast to OtherTool to fail"),
+            Err(err) => err,
+        };
+
+        assert!(Arc::ptr_eq(&err, &original));
+        assert_eq!(err.name(), "example_tool");
     }
 }

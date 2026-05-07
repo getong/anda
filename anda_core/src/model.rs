@@ -57,6 +57,39 @@ impl AgentInput {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PromptCommand {
+    #[default]
+    Ping,
+    Plain {
+        prompt: String,
+    },
+    Command {
+        command: String,
+        prompt: String,
+    },
+}
+
+impl From<String> for PromptCommand {
+    fn from(prompt: String) -> Self {
+        let trimmed = prompt.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("/ping") {
+            return Self::Ping;
+        }
+
+        let Some(stripped) = trimmed.strip_prefix('/') else {
+            return Self::Plain { prompt };
+        };
+        let command_end = stripped.find(char::is_whitespace).unwrap_or(stripped.len());
+        let command = &stripped[..command_end];
+
+        Self::Command {
+            command: command.to_lowercase().to_string(),
+            prompt,
+        }
+    }
+}
+
 /// Output produced by an agent execution.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AgentOutput {
@@ -65,7 +98,7 @@ pub struct AgentOutput {
 
     /// Optional intermediate reasoning text returned by providers that expose it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<String>,
+    pub thoughts: Option<String>,
 
     /// The usage statistics for the agent execution.
     pub usage: Usage,
@@ -101,9 +134,80 @@ pub struct AgentOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation: Option<u64>,
 
+    /// The session ID for the agent execution, if applicable.
+    /// This is used to correlate related conversations or executions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+
     /// The model used by the agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PartialAgentOutput {
+    pub content: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thoughts: Option<String>,
+
+    /// Failure reason if execution failed. `None` indicates success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_reason: Option<String>,
+
+    /// The conversation ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<u64>,
+
+    /// The session ID for the agent execution, if applicable.
+    /// This is used to correlate related conversations or executions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+
+    /// The model used by the agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl AgentOutput {
+    pub fn into_tool_output(self) -> ToolOutput<Json> {
+        let AgentOutput {
+            content,
+            thoughts,
+            usage,
+            tools_usage,
+            failed_reason,
+            artifacts,
+            conversation,
+            session,
+            model,
+            ..
+        } = self;
+        let has_metadata = thoughts.is_some()
+            || failed_reason.is_some()
+            || conversation.is_some()
+            || session.is_some()
+            || model.is_some();
+        let output = if has_metadata {
+            json!(PartialAgentOutput {
+                content,
+                thoughts,
+                failed_reason,
+                conversation,
+                session,
+                model,
+            })
+        } else {
+            serde_json::from_str::<Json>(&content).unwrap_or(Json::String(content))
+        };
+
+        ToolOutput {
+            output,
+            artifacts,
+            usage,
+            tools_usage,
+        }
+    }
 }
 
 fn deserialize_content<'de, D>(deserializer: D) -> Result<Vec<ContentPart>, D::Error>
@@ -492,6 +596,10 @@ pub struct ToolOutput<T> {
 
     /// The usage statistics for the tool execution.
     pub usage: Usage,
+
+    /// The usage statistics for each tool called by the agent.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tools_usage: HashMap<String, Usage>,
 }
 
 impl<T> ToolOutput<T> {
@@ -501,6 +609,7 @@ impl<T> ToolOutput<T> {
             output,
             artifacts: Vec::new(),
             usage: Usage::default(),
+            tools_usage: HashMap::new(),
         }
     }
 }
@@ -795,6 +904,36 @@ impl std::fmt::Display for Documents {
         }
         write!(f, "</{}>", self.tag)
     }
+}
+
+pub fn prompt_with_resources(prompt: String, resources: &mut Vec<Resource>) -> String {
+    let user_resources = text_resource_documents(resources);
+    if user_resources.is_empty() {
+        prompt
+    } else {
+        format!(
+            "{prompt}\n\n{}",
+            Documents::new("attachments".to_string(), user_resources)
+        )
+    }
+}
+
+pub fn text_resource_documents(resources: &mut Vec<Resource>) -> Vec<Document> {
+    let res = select_resources(resources, &["text".to_string(), "md".to_string()]);
+    let mut user_resources: Vec<Document> = Vec::with_capacity(res.len());
+    for resource in res {
+        if let Some(content) = resource
+            .blob
+            .and_then(|blob| String::from_utf8(blob.0).ok())
+        {
+            user_resources.push(Document::from_text(
+                resource._id.to_string().as_str(),
+                &content,
+            ));
+        }
+    }
+
+    user_resources
 }
 
 #[cfg(test)]
