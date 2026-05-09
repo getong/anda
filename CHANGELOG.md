@@ -2,6 +2,25 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.2] — 2026-05-09
+
+### Features
+
+- **Multi-workspace file tools** — `ReadFileTool`, `EditFileTool`, `WriteFileTool`, and `SearchFileTool` now accept `workspaces: Vec<PathBuf>` instead of a single workspace. Context meta `workspace`/`workspaces` fields take precedence over defaults, with automatic fallback. `SearchFileTool` iterates all workspaces and merges results. New `with_workspaces()` constructor for multi-default setups.
+
+### Improvements
+
+- **Workspace-scoped error messages** — all filesystem tool errors now include workspace, requested path, and resolved path context for faster debugging. New `workspace_access_error()` helper produces consistent "not accessible from any configured workspace" messages.
+- **Note storage limits doubled** — `NOTE_CHAR_LIMIT` 8 KB → 16 KB, `NOTE_MATCH_PREVIEW_LIMIT` 80 → 120 chars.
+
+### Fixes
+
+- **Skill cache** now correctly updates on successful load (`write().entry().insert_entry`).
+
+### Deprecations
+
+- **`google`, `extractor`** modules marked `#[deprecated(since = "0.12.0")]` — will be removed in a future release.
+
 ## [0.12.1] — 2026-05-08
 
 ### Refactors

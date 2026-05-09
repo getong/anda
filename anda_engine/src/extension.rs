@@ -7,20 +7,28 @@
 //! search.
 //!
 //! # Key Components
-//! - [`extractor`]: structured extraction from unstructured text.
 //! - [`fetch`]: signed HTTP fetching and resource loading.
 //! - [`fs`]: workspace-scoped file read, write, search, and edit tools.
-//! - [`google`]: Google search integration.
 //! - [`note`]: lightweight per-agent note storage.
 //! - [`shell`]: native or sandboxed command execution.
 //! - [`skill`]: file-backed skill loading and lifecycle management.
-//! - [`mod@todo`]: session-scoped task tracking for long-running agents.
+//! - [`todo`]: session-scoped task tracking for long-running agents.
 
-pub mod extractor;
 pub mod fetch;
 pub mod fs;
-pub mod google;
 pub mod note;
 pub mod shell;
 pub mod skill;
 pub mod todo;
+
+#[deprecated(
+    since = "0.12.0",
+    note = "The `google` extension is deprecated and will be removed in a future release."
+)]
+pub mod google;
+
+#[deprecated(
+    since = "0.12.0",
+    note = "The `extractor` extension is deprecated and will be removed in a future release."
+)]
+pub mod extractor;
