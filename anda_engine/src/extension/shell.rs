@@ -112,7 +112,7 @@ pub struct ExecArgs {
     #[serde(default)]
     pub env_keys: Vec<String>,
 
-    /// Whether to return immediately and deliver normalized progress plus final output through hooks.
+    /// Whether to return immediately and deliver line-based progress plus final output through hooks.
     #[serde(default)]
     pub background: bool,
 }
@@ -371,7 +371,7 @@ impl Tool<BaseCtx> for ShellTool {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "Whether to run the command in the background (non-blocking). New stdout/stderr output is pushed through background progress hooks about every 3 seconds, with UTF-8 split boundaries preserved and terminal-style rewritten progress lines normalized to their latest visible text. The final output is pushed through background end hooks when the task completes.",
+                        "description": "Whether to run the command in the background (non-blocking). New stdout/stderr output is pushed through background progress hooks about every 3 seconds as line-based progress: plain output is emitted as complete lines, UTF-8 split boundaries are preserved, and terminal-style rewritten progress regions are normalized to their latest changed visible lines. The final output is pushed through background end hooks when the task completes.",
                         "default": false
                     }
                 },

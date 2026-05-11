@@ -4,7 +4,7 @@ use ic_auth_types::Xid;
 use serde_json::json;
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
     process::{ExitStatus, Output, Stdio},
 };
@@ -288,8 +288,18 @@ struct ProgressStreamState {
 
 #[derive(Default)]
 struct TerminalProgressState {
-    line: String,
+    lines: Vec<String>,
+    cursor_row: usize,
     cursor: usize,
+    rewrite_mode: bool,
+    completed_lines: Vec<String>,
+    dirty_rows: BTreeSet<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressMode {
+    Plain,
+    Rewrite,
 }
 
 impl ProgressStreamState {
@@ -306,45 +316,36 @@ impl ProgressStreamState {
 
         self.sent_len += readable_len;
         let text = String::from_utf8_lossy(&unread[..readable_len]);
-        let progress = self.terminal.render(&text);
-        (!progress.is_empty()).then_some(progress)
+        self.terminal.render(&text)
     }
 }
 
 impl TerminalProgressState {
-    fn render(&mut self, text: &str) -> String {
+    fn render(&mut self, text: &str) -> Option<String> {
         if has_rewrite_control(text) {
-            self.render_terminal_text(text)
+            self.rewrite_mode = true;
+        }
+        let mode = if self.rewrite_mode {
+            ProgressMode::Rewrite
         } else {
-            self.update_plain_text(text);
-            text.to_string()
+            ProgressMode::Plain
+        };
+
+        self.apply_text(text, mode);
+        match mode {
+            ProgressMode::Plain => self.take_completed_lines(),
+            ProgressMode::Rewrite => self.take_dirty_lines(),
         }
     }
 
-    fn update_plain_text(&mut self, text: &str) {
-        for ch in text.chars() {
-            if ch == '\n' {
-                self.line.clear();
-                self.cursor = 0;
-            } else {
-                self.write_char(ch);
-            }
-        }
-    }
-
-    fn render_terminal_text(&mut self, text: &str) -> String {
-        let mut output = String::new();
+    fn apply_text(&mut self, text: &str, mode: ProgressMode) {
+        self.ensure_cursor_line();
         let mut chars = text.chars().peekable();
 
         while let Some(ch) = chars.next() {
             match ch {
                 '\r' => self.cursor = 0,
-                '\n' => {
-                    output.push_str(self.line.trim_end_matches(' '));
-                    output.push('\n');
-                    self.line.clear();
-                    self.cursor = 0;
-                }
+                '\n' => self.newline(mode),
                 '\x08' => self.move_cursor_left(),
                 '\x1b' => {
                     self.apply_escape_sequence(&mut chars);
@@ -352,41 +353,160 @@ impl TerminalProgressState {
                 _ => self.write_char(ch),
             }
         }
+    }
 
-        let line = self.line.trim_end_matches(' ');
-        if !line.is_empty() {
-            output.push_str(line);
+    fn take_completed_lines(&mut self) -> Option<String> {
+        if self.completed_lines.is_empty() {
+            return None;
         }
-        output
+        let lines = std::mem::take(&mut self.completed_lines);
+        let output = lines.join("\n");
+        (!output.is_empty()).then_some(output)
+    }
+
+    fn take_dirty_lines(&mut self) -> Option<String> {
+        if self.dirty_rows.is_empty() {
+            return None;
+        }
+        let rows = std::mem::take(&mut self.dirty_rows);
+        let lines = rows
+            .into_iter()
+            .filter_map(|row| self.lines.get(row))
+            .map(|line| line.trim_end_matches(' '))
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
+
+    fn newline(&mut self, mode: ProgressMode) {
+        if mode == ProgressMode::Plain {
+            let line = self.current_line().trim_end_matches(' ').to_string();
+            self.completed_lines.push(line);
+        } else {
+            self.mark_dirty();
+        }
+        self.cursor_row += 1;
+        self.cursor = 0;
+        self.ensure_cursor_line();
     }
 
     fn write_char(&mut self, ch: char) {
-        if self.cursor >= self.line.len() {
-            self.line.push(ch);
-            self.cursor = self.line.len();
+        self.ensure_cursor_line();
+        if self.cursor >= self.lines[self.cursor_row].len() {
+            self.lines[self.cursor_row].push(ch);
+            self.cursor = self.lines[self.cursor_row].len();
+            self.mark_dirty();
             return;
         }
 
-        let end = self.line[self.cursor..]
+        let end = self.lines[self.cursor_row][self.cursor..]
             .char_indices()
             .nth(1)
             .map(|(idx, _)| self.cursor + idx)
-            .unwrap_or(self.line.len());
+            .unwrap_or(self.lines[self.cursor_row].len());
         let mut buf = [0; 4];
-        self.line
-            .replace_range(self.cursor..end, ch.encode_utf8(&mut buf));
+        self.lines[self.cursor_row].replace_range(self.cursor..end, ch.encode_utf8(&mut buf));
         self.cursor += ch.len_utf8();
+        self.mark_dirty();
     }
 
     fn move_cursor_left(&mut self) {
+        self.move_cursor_left_by(1);
+    }
+
+    fn move_cursor_left_by(&mut self, count: usize) {
+        self.ensure_cursor_line();
+        for _ in 0..count {
+            if self.cursor == 0 {
+                return;
+            }
+            self.cursor = self.lines[self.cursor_row][..self.cursor]
+                .char_indices()
+                .next_back()
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+        }
+    }
+
+    fn move_cursor_right_by(&mut self, count: usize) {
+        self.ensure_cursor_line();
+        for _ in 0..count {
+            if self.cursor >= self.lines[self.cursor_row].len() {
+                return;
+            }
+            self.cursor = self.lines[self.cursor_row][self.cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(idx, _)| self.cursor + idx)
+                .unwrap_or(self.lines[self.cursor_row].len());
+        }
+    }
+
+    fn move_cursor_up_by(&mut self, count: usize) {
+        self.cursor_row = self.cursor_row.saturating_sub(count);
+        self.clamp_cursor();
+    }
+
+    fn move_cursor_down_by(&mut self, count: usize) {
+        self.cursor_row = self.cursor_row.saturating_add(count);
+        self.ensure_cursor_line();
+        self.clamp_cursor();
+    }
+
+    fn set_cursor_column(&mut self, column: usize) {
+        self.ensure_cursor_line();
+        let target_column = column.saturating_sub(1);
+        let char_count = self.lines[self.cursor_row].chars().count();
+        if target_column > char_count {
+            self.lines[self.cursor_row]
+                .extend(std::iter::repeat_n(' ', target_column.saturating_sub(char_count)));
+            self.mark_dirty();
+        }
+        self.cursor = byte_index_for_char_column(&self.lines[self.cursor_row], target_column);
+    }
+
+    fn set_cursor_position(&mut self, row: usize, column: usize) {
+        self.cursor_row = row.saturating_sub(1);
+        self.ensure_cursor_line();
+        self.set_cursor_column(column);
+    }
+
+    fn clear_from_cursor(&mut self) {
+        self.ensure_cursor_line();
+        self.lines[self.cursor_row].truncate(self.cursor);
+        self.mark_dirty();
+    }
+
+    fn clear_to_cursor(&mut self) {
+        self.ensure_cursor_line();
         if self.cursor == 0 {
             return;
         }
-        self.cursor = self.line[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+        self.lines[self.cursor_row].replace_range(0..self.cursor, "");
+        self.cursor = 0;
+        self.mark_dirty();
+    }
+
+    fn clear_line(&mut self) {
+        self.ensure_cursor_line();
+        self.lines[self.cursor_row].clear();
+        self.cursor = 0;
+        self.mark_dirty();
+    }
+
+    fn clear_screen(&mut self) {
+        self.lines.clear();
+        self.cursor_row = 0;
+        self.cursor = 0;
+        self.completed_lines.clear();
+        self.dirty_rows.clear();
+        self.ensure_cursor_line();
     }
 
     fn apply_escape_sequence<I>(&mut self, chars: &mut std::iter::Peekable<I>)
@@ -396,15 +516,13 @@ impl TerminalProgressState {
         match chars.peek() {
             Some('[') => {
                 chars.next();
-                let mut command = None;
+                let mut params = String::new();
                 for ch in chars.by_ref() {
                     if ('@'..='~').contains(&ch) {
-                        command = Some(ch);
+                        self.apply_csi_sequence(&params, ch);
                         break;
                     }
-                }
-                if matches!(command, Some('K')) {
-                    self.line.truncate(self.cursor);
+                    params.push(ch);
                 }
             }
             Some(']') => {
@@ -421,6 +539,53 @@ impl TerminalProgressState {
             }
             _ => {}
         }
+    }
+
+    fn apply_csi_sequence(&mut self, params: &str, command: char) {
+        let values = csi_params(params);
+        match command {
+            'A' => self.move_cursor_up_by(csi_param_or(&values, 0, 1)),
+            'B' => self.move_cursor_down_by(csi_param_or(&values, 0, 1)),
+            'C' => self.move_cursor_right_by(csi_param_or(&values, 0, 1)),
+            'D' => self.move_cursor_left_by(csi_param_or(&values, 0, 1)),
+            'G' => self.set_cursor_column(csi_param_or(&values, 0, 1)),
+            'H' | 'f' => {
+                self.set_cursor_position(csi_param_or(&values, 0, 1), csi_param_or(&values, 1, 1))
+            }
+            'J' if csi_param_or(&values, 0, 0) == 2 => self.clear_screen(),
+            'K' => match csi_param_or(&values, 0, 0) {
+                0 => self.clear_from_cursor(),
+                1 => self.clear_to_cursor(),
+                2 => self.clear_line(),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn ensure_cursor_line(&mut self) {
+        while self.lines.len() <= self.cursor_row {
+            self.lines.push(String::new());
+        }
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.ensure_cursor_line();
+        if self.cursor > self.lines[self.cursor_row].len() {
+            self.cursor = self.lines[self.cursor_row].len();
+        }
+        while !self.lines[self.cursor_row].is_char_boundary(self.cursor) && self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+
+    fn current_line(&mut self) -> &str {
+        self.ensure_cursor_line();
+        &self.lines[self.cursor_row]
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty_rows.insert(self.cursor_row);
     }
 }
 
@@ -515,7 +680,60 @@ fn utf8_sequence_len(byte: u8) -> usize {
 }
 
 fn has_rewrite_control(text: &str) -> bool {
-    text.contains(['\r', '\x08', '\x1b'])
+    if text.contains(['\r', '\x08']) {
+        return true;
+    }
+
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' || !matches!(chars.peek(), Some('[')) {
+            continue;
+        }
+        chars.next();
+        for ch in chars.by_ref() {
+            if !('@'..='~').contains(&ch) {
+                continue;
+            }
+            if matches!(ch, 'A' | 'B' | 'C' | 'D' | 'G' | 'H' | 'J' | 'K' | 'f') {
+                return true;
+            }
+            break;
+        }
+    }
+
+    false
+}
+
+fn byte_index_for_char_column(text: &str, column: usize) -> usize {
+    text.char_indices()
+        .nth(column)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
+}
+
+fn csi_params(params: &str) -> Vec<usize> {
+    params
+        .split(';')
+        .filter_map(|part| {
+            let digits = part
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if digits.is_empty() {
+                None
+            } else {
+                digits.parse().ok()
+            }
+        })
+        .collect()
+}
+
+fn csi_param_or(values: &[usize], index: usize, default: usize) -> usize {
+    match values.get(index).copied() {
+        Some(0) if default != 0 => default,
+        Some(value) => value,
+        None => default,
+    }
 }
 
 async fn output_reader_error(
@@ -744,7 +962,21 @@ mod tests {
         assert_eq!(state.next_output(&output), None);
 
         output.push(0xad);
+        assert_eq!(state.next_output(&output), None);
+
+        output.push(b'\n');
         assert_eq!(state.next_output(&output).as_deref(), Some("中"));
+    }
+
+    #[test]
+    fn progress_stream_emits_complete_plain_lines() {
+        let mut state = ProgressStreamState::default();
+        let mut output = b"line 1\npartial".to_vec();
+
+        assert_eq!(state.next_output(&output).as_deref(), Some("line 1"));
+
+        output.extend_from_slice(b" line\n");
+        assert_eq!(state.next_output(&output).as_deref(), Some("partial line"));
     }
 
     #[test]
@@ -755,6 +987,28 @@ mod tests {
             state.next_output(b"10%\r20%\r100%").as_deref(),
             Some("100%")
         );
+    }
+
+    #[test]
+    fn progress_stream_keeps_rewrite_mode_across_ticks() {
+        let mut state = ProgressStreamState::default();
+        let mut output = b"10%\r".to_vec();
+
+        assert_eq!(state.next_output(&output).as_deref(), Some("10%"));
+
+        output.extend_from_slice(b"20%");
+        assert_eq!(state.next_output(&output).as_deref(), Some("20%"));
+    }
+
+    #[test]
+    fn progress_stream_keeps_colored_plain_output_line_based() {
+        let mut state = ProgressStreamState::default();
+        let mut output = b"\x1b[31mred\x1b[0m".to_vec();
+
+        assert_eq!(state.next_output(&output), None);
+
+        output.push(b'\n');
+        assert_eq!(state.next_output(&output).as_deref(), Some("red"));
     }
 
     #[test]
@@ -774,6 +1028,18 @@ mod tests {
         assert_eq!(
             state.next_output("中\x08文".as_bytes()).as_deref(),
             Some("文")
+        );
+    }
+
+    #[test]
+    fn progress_stream_reports_all_changed_visible_progress_lines() {
+        let mut state = ProgressStreamState::default();
+
+        assert_eq!(
+            state
+                .next_output(b"file-a 10%\nfile-b 20%\x1b[1A\rfile-a 90%\x1b[1B\rfile-b 80%")
+                .as_deref(),
+            Some("file-a 90%\nfile-b 80%")
         );
     }
 

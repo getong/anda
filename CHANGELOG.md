@@ -2,6 +2,17 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.4] — 2026-05-11
+
+### Features
+
+- **2D terminal emulation for shell progress** — `TerminalProgressState` upgraded from single-line buffer to full 2D terminal model with multi-line scrolling, cursor row tracking, and dirty-row incremental output. Supports CSI cursor movement (A/B/C/D), absolute positioning (G/H/f), line/screen erase (J/K), and multi-line parallel progress bars — all rewritten lines across rows are reported together per progress tick.
+- **Smarter rewrite-mode detection** — `has_rewrite_control()` now only activates rewrite mode for actual terminal-control CSI sequences, not passive styling (colors, decorations). Plain ANSI-styled output stays in line-buffered mode and is emitted on newline boundaries only.
+
+### Refactors
+
+- **Plain progress mode is line-buffered** — non-rewrite output accumulates until `\n`, then emits complete lines via `completed_lines` buffer. No more mid-line fragmentation in plain-text progress.
+
 ## [0.12.3] — 2026-05-11
 
 ### Features
