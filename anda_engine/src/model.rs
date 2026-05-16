@@ -101,11 +101,21 @@ impl ModelConfig {
                 }
                 Model::with_completer(Arc::new(cli.completion_model(&self.model)))
             }
-            "openai" => Model::with_completer(Arc::new(
-                openai::Client::new(&self.api_key, Some(self.api_base.clone()))
-                    .with_client(http_client)
-                    .completion_model_v2(&self.model),
-            )),
+            "openai" => {
+                if self.model.starts_with("gpt") {
+                    Model::with_completer(Arc::new(
+                        openai::Client::new(&self.api_key, Some(self.api_base.clone()))
+                            .with_client(http_client)
+                            .completion_model_v2(&self.model),
+                    ))
+                } else {
+                    Model::with_completer(Arc::new(
+                        openai::Client::new(&self.api_key, Some(self.api_base.clone()))
+                            .with_client(http_client)
+                            .completion_model(&self.model),
+                    ))
+                }
+            }
             _ => return Err(format!("unsupported model family: {}", self.family).into()),
         };
 

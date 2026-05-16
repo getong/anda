@@ -1,10 +1,50 @@
 use anda_core::{
-    AgentOutput, BoxError, ContentPart, Json, Message, Usage as ModelUsage, part_to_data_url,
+    AgentOutput, BoxError, ContentPart, Json, Message, Usage as ModelUsage,
+    inline_data_from_data_url, part_to_data_url,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Map;
+use serde_json::{Map, json};
 
 use crate::unix_ms;
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_image_detail() -> String {
+    "auto".to_string()
+}
+
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MessageContentInput {
+    Text(String),
+    Items(Vec<ContentItem>),
+}
+
+impl From<MessageContentInput> for Vec<ContentItem> {
+    fn from(value: MessageContentInput) -> Self {
+        match value {
+            MessageContentInput::Text(text) => vec![ContentItem::Text { text }],
+            MessageContentInput::Items(items) => items,
+        }
+    }
+}
+
+fn deserialize_content_items<'de, D>(deserializer: D) -> Result<Vec<ContentItem>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(MessageContentInput::deserialize(deserializer)?.into())
+}
 
 /// The completion request type for OpenAI's Response API: <https://platform.openai.com/docs/api-reference/responses/create>
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -25,10 +65,10 @@ pub struct CompletionRequest {
     /// The temperature. Set higher (up to a max of 1.0) for more creative responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// Controls which (if any) tool is called by the model. "none", "auto", "required"
+    /// Controls which (if any) tool is called by the model.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<String>,
-    /// The tools you want to use. Currently this is limited to functions, but will be expanded on in future.
+    pub tool_choice: Option<ToolChoice>,
+    /// The tools you want to use.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
     /// Additional parameters
@@ -42,6 +82,12 @@ pub struct AdditionalParameters {
     /// Whether or not a given model task should run in the background (ie a detached process).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<bool>,
+    /// Context management configuration for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<Vec<ContextManagement>>,
+    /// Conversation state to attach this response to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ResponseConversationParam>,
     /// The text response format. This is where you would add structured outputs (if you want them).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextConfig>,
@@ -54,6 +100,27 @@ pub struct AdditionalParameters {
     /// Whether or not the response should be truncated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation: Option<TruncationStrategy>,
+    /// Maximum number of built-in tool calls processed in the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u64>,
+    /// Prompt template reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<ResponsePrompt>,
+    /// Cache key used to improve prompt cache hit rates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// Prompt cache retention policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+    /// Stable safety identifier for the application end user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+    /// Streaming behavior options.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+    /// Number of token logprobs to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u8>,
     /// The username of the user (that you want to use).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -77,6 +144,55 @@ pub struct AdditionalParameters {
     pub store: Option<bool>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ContextManagement {
+    pub r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_threshold: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ResponseConversationParam {
+    Id(String),
+    Object { id: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResponseConversation {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResponsePrompt {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variables: Option<std::collections::HashMap<String, PromptVariable>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum PromptVariable {
+    String(String),
+    Content(ContentItem),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheRetention {
+    InMemory,
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct StreamOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
+}
+
 /// The standard response format from OpenAI's Responses API.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletionResponse {
@@ -84,7 +200,7 @@ pub struct CompletionResponse {
     pub id: String,
     /// UNIX epoch in seconds.
     pub created_at: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub output_text: String,
     /// Response error (optional)
     pub error: Option<ResponseError>,
@@ -96,7 +212,7 @@ pub struct CompletionResponse {
     /// The model name
     pub model: String,
     /// Token usage
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub usage: ResponsesUsage,
     /// The model output (messages, etc will go here)
     pub output: Vec<Json>,
@@ -176,6 +292,214 @@ impl CompletionResponse {
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum StreamEvent {
+    #[serde(rename = "response.created")]
+    ResponseCreated { response: CompletionResponse },
+    #[serde(rename = "response.in_progress")]
+    ResponseInProgress { response: CompletionResponse },
+    #[serde(rename = "response.completed")]
+    ResponseCompleted { response: CompletionResponse },
+    #[serde(rename = "response.failed")]
+    ResponseFailed { response: CompletionResponse },
+    #[serde(rename = "response.incomplete")]
+    ResponseIncomplete { response: CompletionResponse },
+    #[serde(rename = "response.output_item.added")]
+    ResponseOutputItemAdded {
+        output_index: usize,
+        item: MessageItem,
+    },
+    #[serde(rename = "response.output_item.done")]
+    ResponseOutputItemDone {
+        output_index: usize,
+        item: MessageItem,
+    },
+    #[serde(rename = "response.content_part.added")]
+    ResponseContentPartAdded {
+        item_id: String,
+        output_index: usize,
+        content_index: usize,
+        part: ContentItem,
+    },
+    #[serde(rename = "response.content_part.done")]
+    ResponseContentPartDone {
+        item_id: String,
+        output_index: usize,
+        content_index: usize,
+        part: ContentItem,
+    },
+    #[serde(rename = "response.output_text.delta")]
+    ResponseOutputTextDelta {
+        item_id: String,
+        output_index: usize,
+        content_index: usize,
+        delta: String,
+    },
+    #[serde(rename = "response.output_text.done")]
+    ResponseOutputTextDone {
+        item_id: String,
+        output_index: usize,
+        content_index: usize,
+        text: String,
+    },
+    #[serde(untagged)]
+    Any(Json),
+}
+
+impl<'de> Deserialize<'de> for StreamEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Json::deserialize(deserializer)?;
+        match &value {
+            Json::Object(map)
+                if matches!(
+                    map.get("type").and_then(|t| t.as_str()),
+                    Some(
+                        "response.created"
+                            | "response.in_progress"
+                            | "response.completed"
+                            | "response.failed"
+                            | "response.incomplete"
+                            | "response.output_item.added"
+                            | "response.output_item.done"
+                            | "response.content_part.added"
+                            | "response.content_part.done"
+                            | "response.output_text.delta"
+                            | "response.output_text.done"
+                    )
+                ) =>
+            {
+                #[allow(clippy::enum_variant_names)]
+                #[derive(Deserialize)]
+                #[serde(tag = "type")]
+                enum Helper {
+                    #[serde(rename = "response.created")]
+                    ResponseCreated { response: CompletionResponse },
+                    #[serde(rename = "response.in_progress")]
+                    ResponseInProgress { response: CompletionResponse },
+                    #[serde(rename = "response.completed")]
+                    ResponseCompleted { response: CompletionResponse },
+                    #[serde(rename = "response.failed")]
+                    ResponseFailed { response: CompletionResponse },
+                    #[serde(rename = "response.incomplete")]
+                    ResponseIncomplete { response: CompletionResponse },
+                    #[serde(rename = "response.output_item.added")]
+                    ResponseOutputItemAdded {
+                        output_index: usize,
+                        item: MessageItem,
+                    },
+                    #[serde(rename = "response.output_item.done")]
+                    ResponseOutputItemDone {
+                        output_index: usize,
+                        item: MessageItem,
+                    },
+                    #[serde(rename = "response.content_part.added")]
+                    ResponseContentPartAdded {
+                        item_id: String,
+                        output_index: usize,
+                        content_index: usize,
+                        part: ContentItem,
+                    },
+                    #[serde(rename = "response.content_part.done")]
+                    ResponseContentPartDone {
+                        item_id: String,
+                        output_index: usize,
+                        content_index: usize,
+                        part: ContentItem,
+                    },
+                    #[serde(rename = "response.output_text.delta")]
+                    ResponseOutputTextDelta {
+                        item_id: String,
+                        output_index: usize,
+                        content_index: usize,
+                        delta: String,
+                    },
+                    #[serde(rename = "response.output_text.done")]
+                    ResponseOutputTextDone {
+                        item_id: String,
+                        output_index: usize,
+                        content_index: usize,
+                        text: String,
+                    },
+                }
+
+                match serde_json::from_value::<Helper>(value.clone()) {
+                    Ok(Helper::ResponseCreated { response }) => {
+                        Ok(StreamEvent::ResponseCreated { response })
+                    }
+                    Ok(Helper::ResponseInProgress { response }) => {
+                        Ok(StreamEvent::ResponseInProgress { response })
+                    }
+                    Ok(Helper::ResponseCompleted { response }) => {
+                        Ok(StreamEvent::ResponseCompleted { response })
+                    }
+                    Ok(Helper::ResponseFailed { response }) => {
+                        Ok(StreamEvent::ResponseFailed { response })
+                    }
+                    Ok(Helper::ResponseIncomplete { response }) => {
+                        Ok(StreamEvent::ResponseIncomplete { response })
+                    }
+                    Ok(Helper::ResponseOutputItemAdded { output_index, item }) => {
+                        Ok(StreamEvent::ResponseOutputItemAdded { output_index, item })
+                    }
+                    Ok(Helper::ResponseOutputItemDone { output_index, item }) => {
+                        Ok(StreamEvent::ResponseOutputItemDone { output_index, item })
+                    }
+                    Ok(Helper::ResponseContentPartAdded {
+                        item_id,
+                        output_index,
+                        content_index,
+                        part,
+                    }) => Ok(StreamEvent::ResponseContentPartAdded {
+                        item_id,
+                        output_index,
+                        content_index,
+                        part,
+                    }),
+                    Ok(Helper::ResponseContentPartDone {
+                        item_id,
+                        output_index,
+                        content_index,
+                        part,
+                    }) => Ok(StreamEvent::ResponseContentPartDone {
+                        item_id,
+                        output_index,
+                        content_index,
+                        part,
+                    }),
+                    Ok(Helper::ResponseOutputTextDelta {
+                        item_id,
+                        output_index,
+                        content_index,
+                        delta,
+                    }) => Ok(StreamEvent::ResponseOutputTextDelta {
+                        item_id,
+                        output_index,
+                        content_index,
+                        delta,
+                    }),
+                    Ok(Helper::ResponseOutputTextDone {
+                        item_id,
+                        output_index,
+                        content_index,
+                        text,
+                    }) => Ok(StreamEvent::ResponseOutputTextDone {
+                        item_id,
+                        output_index,
+                        content_index,
+                        text,
+                    }),
+                    Err(_) => Ok(StreamEvent::Any(value)),
+                }
+            }
+            _ => Ok(StreamEvent::Any(value)),
+        }
+    }
+}
+
 /// An input item for CompletionRequest.
 #[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -189,6 +513,50 @@ pub enum MessageItem {
         // in output message
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<MessagePhase>,
+    },
+    FileSearchCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        queries: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        results: Option<Vec<FileSearchResult>>,
+    },
+    ComputerCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_safety_checks: Vec<ComputerSafetyCheck>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action: Option<Json>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actions: Option<Vec<Json>>,
+    },
+    ComputerCallOutput {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        output: ComputerScreenshot,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        acknowledged_safety_checks: Option<Vec<ComputerSafetyCheck>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    WebSearchCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        action: WebSearchAction,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     FunctionCall {
         name: String,
@@ -208,6 +576,35 @@ pub enum MessageItem {
         output: FunctionCallOutput,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    ToolSearchCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        arguments: Json,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        execution: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    ToolSearchOutput {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<ToolDefinition>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        execution: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
     },
     Reasoning {
         id: String,
@@ -218,6 +615,140 @@ pub enum MessageItem {
         encrypted_content: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+    },
+    Compaction {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        encrypted_content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    ImageGenerationCall {
+        id: String,
+        result: String,
+        status: String,
+    },
+    CodeInterpreterCall {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        container_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outputs: Option<Vec<CodeInterpreterOutput>>,
+        status: String,
+    },
+    LocalShellCall {
+        id: String,
+        action: LocalShellAction,
+        call_id: String,
+        status: String,
+    },
+    LocalShellCallOutput {
+        id: String,
+        output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    ShellCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        action: ShellAction,
+        call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        environment: Option<ShellEnvironment>,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    ShellCallOutput {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_output_length: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        output: Vec<ShellCallOutputContent>,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    ApplyPatchCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        operation: ApplyPatchOperation,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    ApplyPatchCallOutput {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    McpCall {
+        id: String,
+        arguments: String,
+        name: String,
+        server_label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_request_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    McpListTools {
+        id: String,
+        server_label: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<McpTool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    McpApprovalRequest {
+        id: String,
+        arguments: String,
+        name: String,
+        server_label: String,
+    },
+    McpApprovalResponse {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        approval_request_id: String,
+        approve: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    CustomToolCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        input: String,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+    },
+    CustomToolCallOutput {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        output: FunctionCallOutput,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    CompactionTrigger,
+    ItemReference {
+        id: String,
     },
     #[serde(untagged)]
     Any(Json),
@@ -233,7 +764,35 @@ impl<'de> Deserialize<'de> for MessageItem {
             Json::Object(map)
                 if matches!(
                     map.get("type").and_then(|t| t.as_str()),
-                    Some("message" | "function_call" | "function_call_output" | "reasoning")
+                    Some(
+                        "message"
+                            | "file_search_call"
+                            | "computer_call"
+                            | "computer_call_output"
+                            | "web_search_call"
+                            | "function_call"
+                            | "function_call_output"
+                            | "tool_search_call"
+                            | "tool_search_output"
+                            | "reasoning"
+                            | "compaction"
+                            | "image_generation_call"
+                            | "code_interpreter_call"
+                            | "local_shell_call"
+                            | "local_shell_call_output"
+                            | "shell_call"
+                            | "shell_call_output"
+                            | "apply_patch_call"
+                            | "apply_patch_call_output"
+                            | "mcp_call"
+                            | "mcp_list_tools"
+                            | "mcp_approval_request"
+                            | "mcp_approval_response"
+                            | "custom_tool_call"
+                            | "custom_tool_call_output"
+                            | "compaction_trigger"
+                            | "item_reference"
+                    )
                 ) =>
             {
                 #[derive(Deserialize)]
@@ -241,9 +800,40 @@ impl<'de> Deserialize<'de> for MessageItem {
                 enum Helper {
                     Message {
                         role: String,
+                        #[serde(deserialize_with = "deserialize_content_items")]
                         content: Vec<ContentItem>,
                         status: Option<String>,
                         id: Option<String>,
+                        phase: Option<MessagePhase>,
+                    },
+                    FileSearchCall {
+                        id: Option<String>,
+                        #[serde(default)]
+                        queries: Vec<String>,
+                        status: Option<String>,
+                        results: Option<Vec<FileSearchResult>>,
+                    },
+                    ComputerCall {
+                        id: Option<String>,
+                        call_id: String,
+                        #[serde(default)]
+                        pending_safety_checks: Vec<ComputerSafetyCheck>,
+                        status: Option<String>,
+                        action: Option<Json>,
+                        actions: Option<Vec<Json>>,
+                    },
+                    ComputerCallOutput {
+                        id: Option<String>,
+                        call_id: String,
+                        output: ComputerScreenshot,
+                        acknowledged_safety_checks: Option<Vec<ComputerSafetyCheck>>,
+                        status: Option<String>,
+                        created_by: Option<String>,
+                    },
+                    WebSearchCall {
+                        id: Option<String>,
+                        action: WebSearchAction,
+                        status: Option<String>,
                     },
                     FunctionCall {
                         name: String,
@@ -258,6 +848,24 @@ impl<'de> Deserialize<'de> for MessageItem {
                         call_id: String,
                         output: FunctionCallOutput,
                         status: Option<String>,
+                        created_by: Option<String>,
+                    },
+                    ToolSearchCall {
+                        id: Option<String>,
+                        call_id: Option<String>,
+                        arguments: Json,
+                        execution: Option<String>,
+                        status: Option<String>,
+                        created_by: Option<String>,
+                    },
+                    ToolSearchOutput {
+                        id: Option<String>,
+                        call_id: Option<String>,
+                        #[serde(default)]
+                        tools: Vec<ToolDefinition>,
+                        execution: Option<String>,
+                        status: Option<String>,
+                        created_by: Option<String>,
                     },
                     Reasoning {
                         id: String,
@@ -265,6 +873,112 @@ impl<'de> Deserialize<'de> for MessageItem {
                         content: Option<Vec<ReasoningContent>>,
                         encrypted_content: Option<String>,
                         status: Option<String>,
+                    },
+                    Compaction {
+                        id: Option<String>,
+                        encrypted_content: String,
+                        created_by: Option<String>,
+                    },
+                    ImageGenerationCall {
+                        id: String,
+                        result: String,
+                        status: String,
+                    },
+                    CodeInterpreterCall {
+                        id: String,
+                        code: Option<String>,
+                        container_id: String,
+                        outputs: Option<Vec<CodeInterpreterOutput>>,
+                        status: String,
+                    },
+                    LocalShellCall {
+                        id: String,
+                        action: LocalShellAction,
+                        call_id: String,
+                        status: String,
+                    },
+                    LocalShellCallOutput {
+                        id: String,
+                        output: String,
+                        status: Option<String>,
+                    },
+                    ShellCall {
+                        id: Option<String>,
+                        action: ShellAction,
+                        call_id: String,
+                        environment: Option<ShellEnvironment>,
+                        status: String,
+                        created_by: Option<String>,
+                    },
+                    ShellCallOutput {
+                        id: Option<String>,
+                        call_id: String,
+                        max_output_length: Option<u64>,
+                        #[serde(default)]
+                        output: Vec<ShellCallOutputContent>,
+                        status: String,
+                        created_by: Option<String>,
+                    },
+                    ApplyPatchCall {
+                        id: Option<String>,
+                        call_id: String,
+                        operation: ApplyPatchOperation,
+                        status: String,
+                        created_by: Option<String>,
+                    },
+                    ApplyPatchCallOutput {
+                        id: Option<String>,
+                        call_id: String,
+                        status: String,
+                        output: Option<String>,
+                        created_by: Option<String>,
+                    },
+                    McpCall {
+                        id: String,
+                        arguments: String,
+                        name: String,
+                        server_label: String,
+                        approval_request_id: Option<String>,
+                        error: Option<String>,
+                        output: Option<String>,
+                        status: Option<String>,
+                    },
+                    McpListTools {
+                        id: String,
+                        server_label: String,
+                        #[serde(default)]
+                        tools: Vec<McpTool>,
+                        error: Option<String>,
+                    },
+                    McpApprovalRequest {
+                        id: String,
+                        arguments: String,
+                        name: String,
+                        server_label: String,
+                    },
+                    McpApprovalResponse {
+                        id: Option<String>,
+                        approval_request_id: String,
+                        approve: bool,
+                        reason: Option<String>,
+                    },
+                    CustomToolCall {
+                        id: Option<String>,
+                        call_id: String,
+                        input: String,
+                        name: String,
+                        namespace: Option<String>,
+                    },
+                    CustomToolCallOutput {
+                        id: Option<String>,
+                        call_id: String,
+                        output: FunctionCallOutput,
+                        status: Option<String>,
+                        created_by: Option<String>,
+                    },
+                    CompactionTrigger,
+                    ItemReference {
+                        id: String,
                     },
                 }
 
@@ -275,12 +989,58 @@ impl<'de> Deserialize<'de> for MessageItem {
                             content,
                             status,
                             id,
+                            phase,
                         } => MessageItem::Message {
                             role,
                             content,
                             status,
                             id,
+                            phase,
                         },
+                        Helper::FileSearchCall {
+                            id,
+                            queries,
+                            status,
+                            results,
+                        } => MessageItem::FileSearchCall {
+                            id,
+                            queries,
+                            status,
+                            results,
+                        },
+                        Helper::ComputerCall {
+                            id,
+                            call_id,
+                            pending_safety_checks,
+                            status,
+                            action,
+                            actions,
+                        } => MessageItem::ComputerCall {
+                            id,
+                            call_id,
+                            pending_safety_checks,
+                            status,
+                            action,
+                            actions,
+                        },
+                        Helper::ComputerCallOutput {
+                            id,
+                            call_id,
+                            output,
+                            acknowledged_safety_checks,
+                            status,
+                            created_by,
+                        } => MessageItem::ComputerCallOutput {
+                            id,
+                            call_id,
+                            output,
+                            acknowledged_safety_checks,
+                            status,
+                            created_by,
+                        },
+                        Helper::WebSearchCall { id, action, status } => {
+                            MessageItem::WebSearchCall { id, action, status }
+                        }
                         Helper::FunctionCall {
                             name,
                             arguments,
@@ -301,11 +1061,43 @@ impl<'de> Deserialize<'de> for MessageItem {
                             call_id,
                             output,
                             status,
+                            created_by,
                         } => MessageItem::FunctionCallOutput {
                             id,
                             call_id,
                             output,
                             status,
+                            created_by,
+                        },
+                        Helper::ToolSearchCall {
+                            id,
+                            call_id,
+                            arguments,
+                            execution,
+                            status,
+                            created_by,
+                        } => MessageItem::ToolSearchCall {
+                            id,
+                            call_id,
+                            arguments,
+                            execution,
+                            status,
+                            created_by,
+                        },
+                        Helper::ToolSearchOutput {
+                            id,
+                            call_id,
+                            tools,
+                            execution,
+                            status,
+                            created_by,
+                        } => MessageItem::ToolSearchOutput {
+                            id,
+                            call_id,
+                            tools,
+                            execution,
+                            status,
+                            created_by,
                         },
                         Helper::Reasoning {
                             id,
@@ -320,6 +1112,181 @@ impl<'de> Deserialize<'de> for MessageItem {
                             encrypted_content,
                             status,
                         },
+                        Helper::Compaction {
+                            id,
+                            encrypted_content,
+                            created_by,
+                        } => MessageItem::Compaction {
+                            id,
+                            encrypted_content,
+                            created_by,
+                        },
+                        Helper::ImageGenerationCall { id, result, status } => {
+                            MessageItem::ImageGenerationCall { id, result, status }
+                        }
+                        Helper::CodeInterpreterCall {
+                            id,
+                            code,
+                            container_id,
+                            outputs,
+                            status,
+                        } => MessageItem::CodeInterpreterCall {
+                            id,
+                            code,
+                            container_id,
+                            outputs,
+                            status,
+                        },
+                        Helper::LocalShellCall {
+                            id,
+                            action,
+                            call_id,
+                            status,
+                        } => MessageItem::LocalShellCall {
+                            id,
+                            action,
+                            call_id,
+                            status,
+                        },
+                        Helper::LocalShellCallOutput { id, output, status } => {
+                            MessageItem::LocalShellCallOutput { id, output, status }
+                        }
+                        Helper::ShellCall {
+                            id,
+                            action,
+                            call_id,
+                            environment,
+                            status,
+                            created_by,
+                        } => MessageItem::ShellCall {
+                            id,
+                            action,
+                            call_id,
+                            environment,
+                            status,
+                            created_by,
+                        },
+                        Helper::ShellCallOutput {
+                            id,
+                            call_id,
+                            max_output_length,
+                            output,
+                            status,
+                            created_by,
+                        } => MessageItem::ShellCallOutput {
+                            id,
+                            call_id,
+                            max_output_length,
+                            output,
+                            status,
+                            created_by,
+                        },
+                        Helper::ApplyPatchCall {
+                            id,
+                            call_id,
+                            operation,
+                            status,
+                            created_by,
+                        } => MessageItem::ApplyPatchCall {
+                            id,
+                            call_id,
+                            operation,
+                            status,
+                            created_by,
+                        },
+                        Helper::ApplyPatchCallOutput {
+                            id,
+                            call_id,
+                            status,
+                            output,
+                            created_by,
+                        } => MessageItem::ApplyPatchCallOutput {
+                            id,
+                            call_id,
+                            status,
+                            output,
+                            created_by,
+                        },
+                        Helper::McpCall {
+                            id,
+                            arguments,
+                            name,
+                            server_label,
+                            approval_request_id,
+                            error,
+                            output,
+                            status,
+                        } => MessageItem::McpCall {
+                            id,
+                            arguments,
+                            name,
+                            server_label,
+                            approval_request_id,
+                            error,
+                            output,
+                            status,
+                        },
+                        Helper::McpListTools {
+                            id,
+                            server_label,
+                            tools,
+                            error,
+                        } => MessageItem::McpListTools {
+                            id,
+                            server_label,
+                            tools,
+                            error,
+                        },
+                        Helper::McpApprovalRequest {
+                            id,
+                            arguments,
+                            name,
+                            server_label,
+                        } => MessageItem::McpApprovalRequest {
+                            id,
+                            arguments,
+                            name,
+                            server_label,
+                        },
+                        Helper::McpApprovalResponse {
+                            id,
+                            approval_request_id,
+                            approve,
+                            reason,
+                        } => MessageItem::McpApprovalResponse {
+                            id,
+                            approval_request_id,
+                            approve,
+                            reason,
+                        },
+                        Helper::CustomToolCall {
+                            id,
+                            call_id,
+                            input,
+                            name,
+                            namespace,
+                        } => MessageItem::CustomToolCall {
+                            id,
+                            call_id,
+                            input,
+                            name,
+                            namespace,
+                        },
+                        Helper::CustomToolCallOutput {
+                            id,
+                            call_id,
+                            output,
+                            status,
+                            created_by,
+                        } => MessageItem::CustomToolCallOutput {
+                            id,
+                            call_id,
+                            output,
+                            status,
+                            created_by,
+                        },
+                        Helper::CompactionTrigger => MessageItem::CompactionTrigger,
+                        Helper::ItemReference { id } => MessageItem::ItemReference { id },
                     }),
                     Err(_) => Ok(MessageItem::Any(value)),
                 }
@@ -327,6 +1294,127 @@ impl<'de> Deserialize<'de> for MessageItem {
             _ => Ok(MessageItem::Any(value)),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct FileSearchResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<Map<String, Json>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ComputerSafetyCheck {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ComputerScreenshot {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct WebSearchAction {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    #[serde(flatten)]
+    pub fields: Map<String, Json>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct CodeInterpreterOutput {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    #[serde(flatten)]
+    pub fields: Map<String, Json>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct LocalShellAction {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub env: Map<String, Json>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ShellAction {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ShellEnvironment {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    #[serde(flatten)]
+    pub fields: Map<String, Json>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ShellCallOutputContent {
+    pub outcome: Json,
+    #[serde(default)]
+    pub stderr: String,
+    #[serde(default)]
+    pub stdout: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ApplyPatchOperation {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct McpTool {
+    #[serde(default)]
+    pub input_schema: Json,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Json>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 pub fn message_into(msg: Message) -> Vec<MessageItem> {
@@ -345,6 +1433,7 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                         content,
                         status: None,
                         id: None,
+                        phase: None,
                     });
                     content = Vec::new();
                 }
@@ -356,6 +1445,20 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                     status: None,
                 });
             }
+            ContentPart::FileData {
+                file_uri,
+                mime_type,
+            } if mime_type
+                .as_ref()
+                .map(|v| v.starts_with("image/"))
+                .unwrap_or(false) =>
+            {
+                content.push(ContentItem::Image {
+                    detail: "auto".to_string(),
+                    image_url: file_uri,
+                    file_id: None,
+                });
+            }
             ContentPart::FileData { file_uri, .. } => {
                 content.push(ContentItem::File {
                     file_data: None,
@@ -363,6 +1466,21 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                     file_id: None,
                     filename: None,
                 });
+            }
+            ContentPart::InlineData { mime_type, data } if mime_type.starts_with("image/") => {
+                content.push(ContentItem::Image {
+                    detail: "auto".to_string(),
+                    image_url: part_to_data_url(&data, Some(&mime_type)),
+                    file_id: None,
+                })
+            }
+            ContentPart::InlineData { mime_type, data } if mime_type.starts_with("audio/") => {
+                content.push(ContentItem::Audio {
+                    input_audio: InputAudio {
+                        format: mime_type.trim_start_matches("audio/").to_string(),
+                        data: part_to_data_url(&data, Some(&mime_type)),
+                    },
+                })
             }
             ContentPart::InlineData { mime_type, data } => content.push(ContentItem::File {
                 file_data: Some(part_to_data_url(&data, Some(&mime_type))),
@@ -381,6 +1499,7 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                         content,
                         status: None,
                         id: None,
+                        phase: None,
                     });
                     content = Vec::new();
                 }
@@ -402,6 +1521,7 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                         content,
                         status: None,
                         id: None,
+                        phase: None,
                     });
                     content = Vec::new();
                 }
@@ -412,6 +1532,7 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                     call_id: call_id.unwrap_or_default(),
                     id: None,
                     status: None,
+                    created_by: None,
                 });
             }
             v => content.push(ContentItem::Any(
@@ -426,6 +1547,7 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
             content,
             status: None,
             id: None,
+            phase: None,
         });
     }
 
@@ -455,26 +1577,58 @@ pub fn message_from(output: Vec<MessageItem>) -> (Option<Message>, Option<String
                             msg.content.push(ContentPart::Text { text });
                         }
                         ContentItem::Image { image_url, .. } => {
-                            msg.content.push(ContentPart::FileData {
-                                file_uri: image_url,
-                                mime_type: Some("image".to_string()),
-                            });
+                            if let Some((data, mime_type)) = inline_data_from_data_url(&image_url) {
+                                msg.content
+                                    .push(ContentPart::InlineData { mime_type, data });
+                            } else {
+                                msg.content.push(ContentPart::FileData {
+                                    file_uri: image_url,
+                                    mime_type: None,
+                                });
+                            }
                         }
                         ContentItem::Audio { input_audio } => {
-                            msg.content.push(ContentPart::FileData {
-                                file_uri: input_audio.data,
-                                mime_type: Some(format!("audio/{}", input_audio.format)),
-                            });
+                            if let Some((data, mime_type)) =
+                                inline_data_from_data_url(&input_audio.data)
+                            {
+                                msg.content
+                                    .push(ContentPart::InlineData { mime_type, data });
+                            } else {
+                                msg.content.push(ContentPart::FileData {
+                                    file_uri: input_audio.data,
+                                    mime_type: None,
+                                });
+                            }
                         }
                         ContentItem::File {
                             file_data,
                             file_url,
-                            ..
+                            file_id,
+                            filename,
                         } => {
-                            msg.content.push(ContentPart::FileData {
-                                file_uri: file_url.or(file_data).unwrap_or_default(),
-                                mime_type: None,
-                            });
+                            if let Some(data_url) = file_data.as_deref()
+                                && let Some((data, mime_type)) = inline_data_from_data_url(data_url)
+                            {
+                                msg.content
+                                    .push(ContentPart::InlineData { mime_type, data });
+                            } else if let Some(data_url) = file_url.as_deref()
+                                && let Some((data, mime_type)) = inline_data_from_data_url(data_url)
+                            {
+                                msg.content
+                                    .push(ContentPart::InlineData { mime_type, data });
+                            } else if let Some(file_uri) = file_url.clone() {
+                                msg.content.push(ContentPart::FileData {
+                                    file_uri,
+                                    mime_type: None,
+                                });
+                            } else {
+                                msg.content.push(ContentPart::Any(json!(ContentItem::File {
+                                    file_data,
+                                    file_url,
+                                    file_id,
+                                    filename,
+                                })));
+                            }
                         }
                         ContentItem::Any(json) => {
                             msg.content.push(ContentPart::Any(json));
@@ -534,6 +1688,9 @@ pub fn message_from(output: Vec<MessageItem>) -> (Option<Message>, Option<String
                 }
             }
             MessageItem::Any(json) => msg.content.push(ContentPart::Any(json)),
+            other => msg.content.push(ContentPart::Any(
+                serde_json::to_value(other).unwrap_or(Json::Null),
+            )),
         }
     }
 
@@ -559,6 +1716,7 @@ pub enum ContentItem {
     #[serde(rename = "input_image")]
     Image {
         detail: String, // One of high, low, or auto. Defaults to auto
+        #[serde(default)]
         image_url: String,
 
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -612,7 +1770,9 @@ impl<'de> Deserialize<'de> for ContentItem {
                     Refusal { refusal: String },
                     #[serde(rename = "input_image")]
                     Image {
+                        #[serde(default = "default_image_detail")]
                         detail: String,
+                        #[serde(default)]
                         image_url: String,
                         file_id: Option<String>,
                     },
@@ -670,7 +1830,9 @@ pub enum FunctionCallOutputItem {
 
     #[serde(rename = "input_image")]
     Image {
+        #[serde(default = "default_image_detail")]
         detail: String, // One of high, low, or auto. Defaults to auto
+        #[serde(default)]
         image_url: String,
 
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -714,19 +1876,686 @@ pub enum ReasoningContent {
     ReasoningText { text: String },
 }
 
-/// The definition of a tool response, repurposed for OpenAI's Responses API.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ToolDefinition {
-    /// Tool name
-    pub name: String,
-    /// Parameters - this should be a JSON schema. Tools should additionally ensure an "additionalParameters" field has been added with the value set to false, as this is required if using OpenAI's strict mode (enabled by default).
-    pub parameters: Json,
-    /// Whether to use strict mode. Enabled by default as it allows for improved efficiency.
-    pub strict: bool,
-    /// The type of tool. This should always be "function".
+/// A tool definition accepted by OpenAI's Responses API.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolDefinition {
+    Function {
+        name: String,
+        #[serde(default)]
+        parameters: Json,
+        #[serde(default = "default_true")]
+        strict: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+    },
+    FileSearch {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        vector_store_ids: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filters: Option<Json>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_num_results: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ranking_options: Option<FileSearchRankingOptions>,
+    },
+    Computer,
+    ComputerUsePreview {
+        display_height: u32,
+        display_width: u32,
+        environment: String,
+    },
+    WebSearch {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filters: Option<WebSearchFilters>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_context_size: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<UserLocation>,
+    },
+    #[serde(rename = "web_search_2025_08_26")]
+    WebSearch20250826 {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filters: Option<WebSearchFilters>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_context_size: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<UserLocation>,
+    },
+    Mcp {
+        server_label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_tools: Option<McpAllowedTools>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        authorization: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        connector_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        headers: Option<Map<String, Json>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        require_approval: Option<Json>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_url: Option<String>,
+    },
+    CodeInterpreter {
+        container: CodeInterpreterContainer,
+    },
+    ImageGeneration {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        background: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_fidelity: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_image_mask: Option<ImageInputMask>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        moderation: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_compression: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_format: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partial_images: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quality: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size: Option<String>,
+    },
+    LocalShell,
+    Shell {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        environment: Option<Json>,
+    },
+    Custom {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<CustomToolInputFormat>,
+    },
+    Namespace {
+        description: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<NamespaceToolDefinition>,
+    },
+    ToolSearch {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        execution: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameters: Option<Json>,
+    },
+    WebSearchPreview {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_content_types: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_context_size: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<UserLocation>,
+    },
+    #[serde(rename = "web_search_preview_2025_03_11")]
+    WebSearchPreview20250311 {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_content_types: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_context_size: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<UserLocation>,
+    },
+    ApplyPatch,
+    #[serde(untagged)]
+    Any(Json),
+}
+
+impl<'de> Deserialize<'de> for ToolDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Json::deserialize(deserializer)?;
+        match &value {
+            Json::Object(map)
+                if matches!(
+                    map.get("type").and_then(|t| t.as_str()),
+                    Some(
+                        "function"
+                            | "file_search"
+                            | "computer"
+                            | "computer_use_preview"
+                            | "web_search"
+                            | "web_search_2025_08_26"
+                            | "mcp"
+                            | "code_interpreter"
+                            | "image_generation"
+                            | "local_shell"
+                            | "shell"
+                            | "custom"
+                            | "namespace"
+                            | "tool_search"
+                            | "web_search_preview"
+                            | "web_search_preview_2025_03_11"
+                            | "apply_patch"
+                    )
+                ) =>
+            {
+                #[derive(Deserialize)]
+                #[serde(tag = "type", rename_all = "snake_case")]
+                enum Helper {
+                    Function {
+                        name: String,
+                        #[serde(default)]
+                        parameters: Json,
+                        #[serde(default = "default_true")]
+                        strict: bool,
+                        description: Option<String>,
+                        defer_loading: Option<bool>,
+                    },
+                    FileSearch {
+                        #[serde(default)]
+                        vector_store_ids: Vec<String>,
+                        filters: Option<Json>,
+                        max_num_results: Option<u32>,
+                        ranking_options: Option<FileSearchRankingOptions>,
+                    },
+                    Computer,
+                    ComputerUsePreview {
+                        display_height: u32,
+                        display_width: u32,
+                        environment: String,
+                    },
+                    WebSearch {
+                        filters: Option<WebSearchFilters>,
+                        search_context_size: Option<String>,
+                        user_location: Option<UserLocation>,
+                    },
+                    #[serde(rename = "web_search_2025_08_26")]
+                    WebSearch20250826 {
+                        filters: Option<WebSearchFilters>,
+                        search_context_size: Option<String>,
+                        user_location: Option<UserLocation>,
+                    },
+                    Mcp {
+                        server_label: String,
+                        allowed_tools: Option<McpAllowedTools>,
+                        authorization: Option<String>,
+                        connector_id: Option<String>,
+                        defer_loading: Option<bool>,
+                        headers: Option<Map<String, Json>>,
+                        require_approval: Option<Json>,
+                        server_description: Option<String>,
+                        server_url: Option<String>,
+                    },
+                    CodeInterpreter {
+                        container: CodeInterpreterContainer,
+                    },
+                    ImageGeneration {
+                        action: Option<String>,
+                        background: Option<String>,
+                        input_fidelity: Option<String>,
+                        input_image_mask: Option<ImageInputMask>,
+                        model: Option<String>,
+                        moderation: Option<String>,
+                        output_compression: Option<u8>,
+                        output_format: Option<String>,
+                        partial_images: Option<u8>,
+                        quality: Option<String>,
+                        size: Option<String>,
+                    },
+                    LocalShell,
+                    Shell {
+                        environment: Option<Json>,
+                    },
+                    Custom {
+                        name: String,
+                        defer_loading: Option<bool>,
+                        description: Option<String>,
+                        format: Option<CustomToolInputFormat>,
+                    },
+                    Namespace {
+                        description: String,
+                        name: String,
+                        #[serde(default)]
+                        tools: Vec<NamespaceToolDefinition>,
+                    },
+                    ToolSearch {
+                        description: Option<String>,
+                        execution: Option<String>,
+                        parameters: Option<Json>,
+                    },
+                    WebSearchPreview {
+                        search_content_types: Option<Vec<String>>,
+                        search_context_size: Option<String>,
+                        user_location: Option<UserLocation>,
+                    },
+                    #[serde(rename = "web_search_preview_2025_03_11")]
+                    WebSearchPreview20250311 {
+                        search_content_types: Option<Vec<String>>,
+                        search_context_size: Option<String>,
+                        user_location: Option<UserLocation>,
+                    },
+                    ApplyPatch,
+                }
+
+                match serde_json::from_value::<Helper>(value.clone()) {
+                    Ok(h) => Ok(match h {
+                        Helper::Function {
+                            name,
+                            parameters,
+                            strict,
+                            description,
+                            defer_loading,
+                        } => ToolDefinition::Function {
+                            name,
+                            parameters,
+                            strict,
+                            description,
+                            defer_loading,
+                        },
+                        Helper::FileSearch {
+                            vector_store_ids,
+                            filters,
+                            max_num_results,
+                            ranking_options,
+                        } => ToolDefinition::FileSearch {
+                            vector_store_ids,
+                            filters,
+                            max_num_results,
+                            ranking_options,
+                        },
+                        Helper::Computer => ToolDefinition::Computer,
+                        Helper::ComputerUsePreview {
+                            display_height,
+                            display_width,
+                            environment,
+                        } => ToolDefinition::ComputerUsePreview {
+                            display_height,
+                            display_width,
+                            environment,
+                        },
+                        Helper::WebSearch {
+                            filters,
+                            search_context_size,
+                            user_location,
+                        } => ToolDefinition::WebSearch {
+                            filters,
+                            search_context_size,
+                            user_location,
+                        },
+                        Helper::WebSearch20250826 {
+                            filters,
+                            search_context_size,
+                            user_location,
+                        } => ToolDefinition::WebSearch20250826 {
+                            filters,
+                            search_context_size,
+                            user_location,
+                        },
+                        Helper::Mcp {
+                            server_label,
+                            allowed_tools,
+                            authorization,
+                            connector_id,
+                            defer_loading,
+                            headers,
+                            require_approval,
+                            server_description,
+                            server_url,
+                        } => ToolDefinition::Mcp {
+                            server_label,
+                            allowed_tools,
+                            authorization,
+                            connector_id,
+                            defer_loading,
+                            headers,
+                            require_approval,
+                            server_description,
+                            server_url,
+                        },
+                        Helper::CodeInterpreter { container } => {
+                            ToolDefinition::CodeInterpreter { container }
+                        }
+                        Helper::ImageGeneration {
+                            action,
+                            background,
+                            input_fidelity,
+                            input_image_mask,
+                            model,
+                            moderation,
+                            output_compression,
+                            output_format,
+                            partial_images,
+                            quality,
+                            size,
+                        } => ToolDefinition::ImageGeneration {
+                            action,
+                            background,
+                            input_fidelity,
+                            input_image_mask,
+                            model,
+                            moderation,
+                            output_compression,
+                            output_format,
+                            partial_images,
+                            quality,
+                            size,
+                        },
+                        Helper::LocalShell => ToolDefinition::LocalShell,
+                        Helper::Shell { environment } => ToolDefinition::Shell { environment },
+                        Helper::Custom {
+                            name,
+                            defer_loading,
+                            description,
+                            format,
+                        } => ToolDefinition::Custom {
+                            name,
+                            defer_loading,
+                            description,
+                            format,
+                        },
+                        Helper::Namespace {
+                            description,
+                            name,
+                            tools,
+                        } => ToolDefinition::Namespace {
+                            description,
+                            name,
+                            tools,
+                        },
+                        Helper::ToolSearch {
+                            description,
+                            execution,
+                            parameters,
+                        } => ToolDefinition::ToolSearch {
+                            description,
+                            execution,
+                            parameters,
+                        },
+                        Helper::WebSearchPreview {
+                            search_content_types,
+                            search_context_size,
+                            user_location,
+                        } => ToolDefinition::WebSearchPreview {
+                            search_content_types,
+                            search_context_size,
+                            user_location,
+                        },
+                        Helper::WebSearchPreview20250311 {
+                            search_content_types,
+                            search_context_size,
+                            user_location,
+                        } => ToolDefinition::WebSearchPreview20250311 {
+                            search_content_types,
+                            search_context_size,
+                            user_location,
+                        },
+                        Helper::ApplyPatch => ToolDefinition::ApplyPatch,
+                    }),
+                    Err(_) => Ok(ToolDefinition::Any(value)),
+                }
+            }
+            _ => Ok(ToolDefinition::Any(value)),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct FileSearchRankingOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid_search: Option<FileSearchHybridSearch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_threshold: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct FileSearchHybridSearch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_weight: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_weight: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct WebSearchFilters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct UserLocation {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum McpAllowedTools {
+    Names(Vec<String>),
+    Filter(McpToolFilter),
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct McpToolFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_names: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum CodeInterpreterContainer {
+    Id(String),
+    Auto(CodeInterpreterContainerAuto),
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct CodeInterpreterContainerAuto {
+    #[serde(rename = "type")]
     pub r#type: String,
-    /// Tool description.
-    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_policy: Option<Json>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ImageInputMask {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CustomToolInputFormat {
+    Text,
+    Grammar { definition: String, syntax: String },
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NamespaceToolDefinition {
+    Function {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameters: Option<Json>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+    },
+    Custom {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<CustomToolInputFormat>,
+    },
+    #[serde(untagged)]
+    Any(Json),
+}
+
+impl<'de> Deserialize<'de> for NamespaceToolDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Json::deserialize(deserializer)?;
+        match &value {
+            Json::Object(map)
+                if matches!(
+                    map.get("type").and_then(|t| t.as_str()),
+                    Some("function" | "custom")
+                ) =>
+            {
+                #[derive(Deserialize)]
+                #[serde(tag = "type", rename_all = "snake_case")]
+                enum Helper {
+                    Function {
+                        name: String,
+                        parameters: Option<Json>,
+                        strict: Option<bool>,
+                        description: Option<String>,
+                        defer_loading: Option<bool>,
+                    },
+                    Custom {
+                        name: String,
+                        defer_loading: Option<bool>,
+                        description: Option<String>,
+                        format: Option<CustomToolInputFormat>,
+                    },
+                }
+
+                match serde_json::from_value::<Helper>(value.clone()) {
+                    Ok(Helper::Function {
+                        name,
+                        parameters,
+                        strict,
+                        description,
+                        defer_loading,
+                    }) => Ok(NamespaceToolDefinition::Function {
+                        name,
+                        parameters,
+                        strict,
+                        description,
+                        defer_loading,
+                    }),
+                    Ok(Helper::Custom {
+                        name,
+                        defer_loading,
+                        description,
+                        format,
+                    }) => Ok(NamespaceToolDefinition::Custom {
+                        name,
+                        defer_loading,
+                        description,
+                        format,
+                    }),
+                    Err(_) => Ok(NamespaceToolDefinition::Any(value)),
+                }
+            }
+            _ => Ok(NamespaceToolDefinition::Any(value)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(ToolChoiceMode),
+    Object(ToolChoiceObject),
+    Any(Json),
+}
+
+impl ToolChoice {
+    pub fn none() -> Self {
+        Self::Mode(ToolChoiceMode::None)
+    }
+
+    pub fn auto() -> Self {
+        Self::Mode(ToolChoiceMode::Auto)
+    }
+
+    pub fn required() -> Self {
+        Self::Mode(ToolChoiceMode::Required)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoiceMode {
+    None,
+    Auto,
+    Required,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoiceObject {
+    AllowedTools {
+        mode: ToolChoiceAllowedMode,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<Json>,
+    },
+    Function {
+        name: String,
+    },
+    Mcp {
+        server_label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    Custom {
+        name: String,
+    },
+    ApplyPatch,
+    Shell,
+    FileSearch,
+    WebSearchPreview,
+    #[serde(rename = "web_search_preview_2025_03_11")]
+    WebSearchPreview20250311,
+    Computer,
+    ComputerUsePreview,
+    ComputerUse,
+    ImageGeneration,
+    CodeInterpreter,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoiceAllowedMode {
+    Auto,
+    Required,
 }
 
 /// Token usage.
@@ -799,7 +2628,10 @@ pub enum TruncationStrategy {
 /// You can either have plain text by default, or attach a JSON schema for the purposes of structured outputs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextConfig {
-    pub format: TextFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<TextFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<TextVerbosity>,
 }
 
 impl TextConfig {
@@ -808,13 +2640,23 @@ impl TextConfig {
         S: Into<String>,
     {
         Self {
-            format: TextFormat::JsonSchema(StructuredOutputsInput {
+            format: Some(TextFormat::JsonSchema(StructuredOutputsInput {
                 name: name.into(),
                 schema,
-                strict: true,
-            }),
+                description: None,
+                strict: Some(true),
+            })),
+            verbosity: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TextVerbosity {
+    Low,
+    Medium,
+    High,
 }
 
 /// The text format (contained by [`TextConfig`]).
@@ -824,6 +2666,7 @@ impl TextConfig {
 #[serde(rename_all = "snake_case")]
 pub enum TextFormat {
     JsonSchema(StructuredOutputsInput),
+    JsonObject,
     #[default]
     Text,
 }
@@ -835,17 +2678,36 @@ pub struct StructuredOutputsInput {
     pub name: String,
     /// Your required output schema. It is recommended that you use the JsonSchema macro, which you can check out at <https://docs.rs/schemars/latest/schemars/trait.JsonSchema.html>.
     pub schema: Json,
+    /// Optional description of the response format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Enable strict output. If you are using your AI agent in a data pipeline or another scenario that requires the data to be absolutely fixed to a given schema, it is recommended to set this to true.
-    pub strict: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Add reasoning to a [`CompletionRequest`].
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reasoning {
     /// How much effort you want the model to put into thinking/reasoning.
-    pub effort: ReasoningEffort,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+    /// Deprecated reasoning summary option retained for API compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<ReasoningSummaryLevel>,
     /// How much effort you want the model to put into writing the reasoning summary.
-    pub summary: ReasoningSummaryLevel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReasoningSummaryLevel>,
+}
+
+impl Default for Reasoning {
+    fn default() -> Self {
+        Self {
+            effort: Some(ReasoningEffort::Medium),
+            generate_summary: None,
+            summary: Some(ReasoningSummaryLevel::Auto),
+        }
+    }
 }
 
 /// The billing service tier that will be used. On auto by default.
@@ -856,12 +2718,15 @@ pub enum OpenAIServiceTier {
     Auto,
     Default,
     Flex,
+    Scale,
+    Priority,
 }
 
 /// The amount of reasoning effort that will be used by a given model.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    None,
     Minimal,
     Low,
     #[default]
@@ -1018,6 +2883,7 @@ mod tests {
                 ],
                 status: None,
                 id: None,
+                phase: None,
             },
             MessageItem::FunctionCall {
                 name: "f".into(),
@@ -1032,6 +2898,7 @@ mod tests {
                 call_id: "c1".into(),
                 id: None,
                 status: None,
+                created_by: None,
             },
             MessageItem::Reasoning {
                 id: "".into(),
@@ -1155,6 +3022,7 @@ mod tests {
             }],
             status: None,
             id: None,
+            phase: None,
         }];
 
         let (msg_opt, failed_reason) = message_from(items);
@@ -1170,6 +3038,7 @@ mod tests {
             content: vec![ContentItem::Text { text: "hi".into() }],
             status: None,
             id: None,
+            phase: None,
         };
         let s = serde_json::to_string(&item).unwrap();
         assert!(s.contains(r#""type":"message""#));
@@ -1194,6 +3063,7 @@ mod tests {
             call_id: "cid".into(),
             id: None,
             status: None,
+            created_by: None,
         };
         let s = serde_json::to_string(&item).unwrap();
         assert!(s.contains(r#""type":"function_call_output""#));
@@ -1207,6 +3077,7 @@ mod tests {
             call_id: "cid".into(),
             id: None,
             status: None,
+            created_by: None,
         };
         let s = serde_json::to_string(&item).unwrap();
         assert!(s.contains(r#""type":"function_call_output""#));
@@ -1222,5 +3093,269 @@ mod tests {
         };
         let s = serde_json::to_string(&item).unwrap();
         assert!(s.contains(r#""type":"reasoning""#));
+    }
+
+    #[test]
+    fn deserializes_response_with_function_tool_and_nullable_fields() {
+        let mut response: CompletionResponse = serde_json::from_value(json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1741294021,
+            "status": "completed",
+            "completed_at": 1741294022,
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "max_output_tokens": null,
+            "model": "gpt-5.4",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "get_current_weather",
+                "arguments": "{\"location\":\"Boston, MA\",\"unit\":\"celsius\"}",
+                "status": "completed"
+            }],
+            "parallel_tool_calls": true,
+            "previous_response_id": null,
+            "reasoning": {
+                "effort": null,
+                "summary": null
+            },
+            "store": true,
+            "text": {"format": {"type": "text"}},
+            "tools": [{
+                "type": "function",
+                "description": "Get current weather",
+                "name": "get_current_weather",
+                "parameters": {"type": "object"},
+                "strict": true
+            }],
+            "usage": {
+                "input_tokens": 291,
+                "output_tokens": 23,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 314
+            },
+            "metadata": {}
+        }))
+        .unwrap();
+
+        response.parse_output();
+        assert_eq!(response.usage.total_tokens, 314);
+        assert_eq!(response.parsed_output.len(), 1);
+
+        assert!(matches!(
+            response.parsed_output.first(),
+            Some(MessageItem::FunctionCall { name, call_id, .. })
+                if name == "get_current_weather" && call_id == "call_1"
+        ));
+        assert!(matches!(
+            response.tools.first(),
+            Some(ToolDefinition::Function {
+                name,
+                description: Some(description),
+                strict: true,
+                ..
+            }) if name == "get_current_weather" && description == "Get current weather"
+        ));
+        assert!(matches!(
+            response.additional_parameters.reasoning,
+            Some(Reasoning {
+                effort: None,
+                summary: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn serializes_request_with_core_tool_types_and_tool_choice() {
+        let request = CompletionRequest {
+            model: "gpt-5.4".into(),
+            input: vec![MessageItem::Message {
+                role: "user".into(),
+                content: vec![ContentItem::Text {
+                    text: "search docs".into(),
+                }],
+                status: None,
+                id: None,
+                phase: None,
+            }],
+            tool_choice: Some(ToolChoice::Object(ToolChoiceObject::Function {
+                name: "lookup".into(),
+            })),
+            tools: vec![
+                ToolDefinition::FileSearch {
+                    vector_store_ids: vec!["vs_1".into()],
+                    filters: Some(json!({"type": "eq", "key": "kind", "value": "doc"})),
+                    max_num_results: Some(5),
+                    ranking_options: None,
+                },
+                ToolDefinition::WebSearchPreview {
+                    search_content_types: Some(vec!["text".into()]),
+                    search_context_size: Some("low".into()),
+                    user_location: None,
+                },
+                ToolDefinition::ToolSearch {
+                    description: Some("load deferred tools".into()),
+                    execution: Some("client".into()),
+                    parameters: Some(json!({"type": "object"})),
+                },
+                ToolDefinition::ApplyPatch,
+            ],
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["tool_choice"]["type"], "function");
+        assert_eq!(value["tool_choice"]["name"], "lookup");
+        assert_eq!(value["tools"][0]["type"], "file_search");
+        assert_eq!(value["tools"][1]["type"], "web_search_preview");
+        assert_eq!(value["tools"][2]["type"], "tool_search");
+        assert_eq!(value["tools"][3]["type"], "apply_patch");
+
+        let choice: ToolChoice = serde_json::from_value(json!({
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [{"type": "function", "name": "lookup"}]
+        }))
+        .unwrap();
+        assert!(matches!(
+            choice,
+            ToolChoice::Object(ToolChoiceObject::AllowedTools {
+                mode: ToolChoiceAllowedMode::Required,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn deserializes_core_output_item_variants() {
+        let items: Vec<MessageItem> = serde_json::from_value(json!([
+            {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "action": {"type": "search", "queries": ["rust serde"]},
+                "status": "completed"
+            },
+            {
+                "type": "code_interpreter_call",
+                "id": "ci_1",
+                "code": null,
+                "container_id": "ctr_1",
+                "outputs": [{"type": "logs", "logs": "ok"}],
+                "status": "completed"
+            },
+            {
+                "type": "shell_call_output",
+                "id": "shout_1",
+                "call_id": "call_shell",
+                "max_output_length": 2000,
+                "output": [{
+                    "outcome": {"type": "exit", "exit_code": 0},
+                    "stdout": "done",
+                    "stderr": ""
+                }],
+                "status": "completed"
+            },
+            {
+                "type": "mcp_call",
+                "id": "mcp_1",
+                "arguments": "{\"q\":\"anda\"}",
+                "name": "search",
+                "server_label": "deepwiki",
+                "status": "completed",
+                "output": "result"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "cto_1",
+                "call_id": "call_custom",
+                "output": "ok",
+                "status": "completed"
+            },
+            {
+                "type": "compaction",
+                "id": "cmp_1",
+                "encrypted_content": "ciphertext"
+            }
+        ]))
+        .unwrap();
+
+        assert!(matches!(items[0], MessageItem::WebSearchCall { .. }));
+        assert!(matches!(items[1], MessageItem::CodeInterpreterCall { .. }));
+        assert!(matches!(items[2], MessageItem::ShellCallOutput { .. }));
+        assert!(matches!(items[3], MessageItem::McpCall { .. }));
+        assert!(matches!(items[4], MessageItem::CustomToolCallOutput { .. }));
+        assert!(matches!(items[5], MessageItem::Compaction { .. }));
+
+        let (message, failed_reason) = message_from(items);
+        assert!(failed_reason.is_none());
+        let message = message.expect("unmapped tool items should be preserved as Any content");
+        assert_eq!(message.content.len(), 6);
+        assert!(matches!(message.content.first(), Some(ContentPart::Any(_))));
+    }
+
+    #[test]
+    fn deserializes_stream_events_with_nullable_response_usage() {
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 1741290958,
+                "status": "in_progress",
+                "error": null,
+                "incomplete_details": null,
+                "instructions": "You are helpful.",
+                "model": "gpt-5.4",
+                "output": [],
+                "parallel_tool_calls": true,
+                "reasoning": {"effort": null, "summary": null},
+                "text": {"format": {"type": "text"}},
+                "tools": [],
+                "usage": null,
+                "metadata": {}
+            }
+        }))
+        .unwrap();
+
+        match event {
+            StreamEvent::ResponseCreated { response } => {
+                assert_eq!(response.id, "resp_1");
+                assert_eq!(response.usage.total_tokens, 0);
+            }
+            _ => panic!("expected response.created"),
+        }
+
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "response.content_part.added",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []}
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::ResponseContentPartAdded {
+                part: ContentItem::OutputText { .. },
+                ..
+            }
+        ));
+
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Hi"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::ResponseOutputTextDelta { delta, .. } if delta == "Hi"
+        ));
     }
 }

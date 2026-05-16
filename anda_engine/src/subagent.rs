@@ -532,7 +532,12 @@ impl Agent<AgentCtx> for SubAgent {
                     CompletionRequest {
                         instructions: self.instructions.clone(),
                         prompt: args.prompt,
-                        content: resources.into_iter().map(ContentPart::from).collect(),
+                        content: resources
+                            .into_iter()
+                            .map(ContentPart::try_from)
+                            .collect::<Result<Vec<_>, _>>()
+                            .ok()
+                            .unwrap_or_default(),
                         tools: ctx.definitions(Some(&self.tools)).await,
                         output_schema: self.output_schema.clone(),
                         ..Default::default()
@@ -616,7 +621,12 @@ impl Agent<AgentCtx> for SubAgent {
         let req = CompletionRequest {
             instructions: self.instructions.clone(),
             prompt,
-            content: resources.into_iter().map(ContentPart::from).collect(),
+            content: resources
+                .into_iter()
+                .map(ContentPart::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .unwrap_or_default(),
             tools: ctx.definitions(Some(&self.tools)).await,
             output_schema: self.output_schema.clone(),
             ..Default::default()

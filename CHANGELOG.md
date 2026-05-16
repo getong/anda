@@ -2,6 +2,29 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.8] — 2026-05-16
+
+### Changed — anda_core v0.12.1
+
+- **`Resource → ContentPart` conversion now uses `TryFrom` with MIME detection** — `impl TryFrom<Resource> for ContentPart` replaces the infallible `From` impl. Binary blobs now use `infer2` to detect the actual MIME type from bytes instead of defaulting to `application/octet-stream`. Resources with neither blob nor URI return `Err(res)` instead of serializing to text.
+- **`inline_data_from_data_url`** — New helper to parse data URLs (`data:[<mime>][;base64],<data>`) and plain base64 strings into `(ByteBufB64, mime_type)` pairs. Handles both base64-encoded and percent-encoded payloads.
+- **`decode_percent_encoded_bytes`** — Internal helper for percent-decoding URL-encoded byte sequences.
+- **Comprehensive test suite for `anda_core::model`** — Added 10 test functions covering `AgentInput`, `ToolInput`, `PromptCommand`, `AgentOutput::into_tool_output`, data URL round-trips, `ContentPart::try_from(Resource)` edge cases, `RequestMeta`, `Usage::accumulate` overflow, `FunctionDefinition`, `Document`/`Documents`, and `Message` deserialization.
+
+### Changed — anda_engine v0.12.8
+
+- **Anthropic: Extended API surface** — Full support for the latest Anthropic Messages API: `SystemPrompt` enum (string or content blocks), `CacheControlEphemeral` for prompt caching, `OutputConfig` with `OutputEffort` and `JsonOutputFormat`, structured `StopDetails::Refusal`, `ToolChoice` constructors (`auto()`, `any()`, `tool()`), `ThinkingDisplay` and `ThinkingType::Adaptive/Disabled`, extended `ContentBlock` variants (document, search_result, server_tool_use, web_search/fetch results, code execution results, container_upload), `ToolResultContent` as text-or-blocks, `CitationsConfig`/`TextCitation`, `UsageServiceTier`/`CacheCreation`/`ServerToolUsage` on `Usage`, `Container` in responses.
+- **Gemini: Extended API surface** — `SafetySetting`/`HarmBlockThreshold`, `cached_content`/`service_tier`/`store` on `GenerateContentRequest`, `ModelStatus`, `GroundingAttribution`/`GroundingMetadata` with rich chunk types (web, images, maps, retrieved context), `LogprobsResult`, `UrlContextMetadata`, `SpeechConfig`/`VoiceConfig`, `ImageConfig`/`MediaResolution`, `Modality` enum, `response_json_schema` fields, `seed`, `enable_enhanced_civic_answers`, extended `FinishReason` variants. `SatisfyRating` renamed to `SafetyRating` with backward-compatible alias. Fixed `satefy_ratings` typo with serde alias.
+- **OpenAI: Full `ChatCompletionRequest` type** — Structured request builder replacing ad-hoc JSON construction. Supports `audio`, `modalities`, `reasoning_effort`, `response_format` (text/json_object/json_schema), `service_tier`, `stop` (string or array), `stream_options`, `tool_choice` (none/auto/required/allowed_tools/function/custom), `verbosity`, `web_search_options`, `prediction`, `prompt_cache_key`/`prompt_cache_retention`, `logprobs`/`top_logprobs`, `safety_identifier`, `seed`, `store`, `metadata`, `user`, `parallel_tool_calls`, `frequency_penalty`/`presence_penalty`.
+- **OpenAI: Content types and refusal handling** — `ChatCompletionMessageContent` supports text, content parts (text/image_url/input_audio/file/refusal), and `null` deserialization. Refusal detection from both legacy `refusal` field and content-block refusals. `MessageOutput` now uses `ChatCompletionMessageContent` and provides `has_output()`/`has_refusal()` helpers.
+- **OpenAI: Custom tool support** — `ToolDefinition` as enum with `Function` and `Custom` variants. `CustomToolDefinition` with text/grammar format. `ToolCallOutput` supports both `function` and `custom` call types. `CustomToolCall` with raw `input` string.
+- **OpenAI: Tool calls extracted to `tool_calls` field** — Assistant messages now serialize tool calls in a top-level `tool_calls` array alongside `content`, matching the OpenAI API shape.
+- **OpenAI: Usage details** — `CompletionTokensDetails` (reasoning_tokens, audio_tokens, accepted/rejected_prediction_tokens) and `PromptTokensDetails` (audio_tokens).
+- **OpenAI: Media type routing** — File/image/audio/video `ContentPart` items now route to the correct content block type (`image_url`, `input_audio`, `video_url`, `file`) based on MIME type.
+- **OpenAI Responses API v2: Extended types** — `StreamEvent` enum with 11 event types. `MessageItem` expanded with file_search_call, computer_call, web_search_call, tool_search, compaction, image_generation, code_interpreter, shell calls, apply_patch, MCP calls, custom tools. `ToolDefinition` expanded with file_search, computer, web_search, MCP, code_interpreter, image_generation, local_shell, shell, custom, namespace, tool_search, apply_patch. `ContextManagement` and `ResponseConversation` for conversation state.
+- **Model routing** — OpenAI models starting with `gpt` now use `completion_model_v2` (Chat Completions API), while non-gpt models use the standard Responses API path.
+- **SubAgent: `From` → `TryFrom` migration** — SubAgent resource-to-ContentPart conversion updated to use the new `TryFrom` impl.
+
 ## [0.12.7] — 2026-05-15
 
 ### Changed

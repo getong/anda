@@ -8,6 +8,10 @@ use std::{fmt, str::FromStr};
 
 use crate::unix_ms;
 
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 // https://ai.google.dev/api/generate-content
 // https://googleapis.github.io/js-genai/release_docs/index.html
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -26,6 +30,18 @@ pub struct GenerateContentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_config: Option<ToolConfig>,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safety_settings: Vec<SafetySetting>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_content: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+
     pub generation_config: GenerationConfig,
 }
 
@@ -43,11 +59,13 @@ pub struct GenerateContentRequest {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateContentResponse {
+    #[serde(default)]
     pub candidates: Vec<Candidate>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_feedback: Option<PromptFeedback>,
 
+    #[serde(default)]
     pub usage_metadata: UsageMetadata,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +73,9 @@ pub struct GenerateContentResponse {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_status: Option<ModelStatus>,
 }
 
 impl GenerateContentResponse {
@@ -129,8 +150,8 @@ pub struct Candidate {
     pub finish_reason: Option<FinishReason>,
     /// List of ratings for the safety of a response candidate. There is at most
     /// one rating per category.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub satefy_ratings: Option<Vec<SatisfyRating>>,
+    #[serde(alias = "satefyRatings", skip_serializing_if = "Option::is_none")]
+    pub safety_ratings: Option<Vec<SafetyRating>>,
     /// Citation information for model-generated candidate.
     ///
     /// This field may be populated with recitation information for any text
@@ -141,12 +162,27 @@ pub struct Candidate {
     /// Token count for this candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_count: Option<u32>,
+    /// Attribution information for sources that contributed to a grounded answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grounding_attributions: Vec<GroundingAttribution>,
+    /// Grounding metadata for the candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grounding_metadata: Option<GroundingMetadata>,
     /// Average log probability score of the candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub avg_logprobs: Option<f32>,
+    pub avg_logprobs: Option<f64>,
+    /// Log-likelihood scores for the response tokens and top tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs_result: Option<LogprobsResult>,
+    /// Metadata related to URL context retrieval tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url_context_metadata: Option<UrlContextMetadata>,
     /// Index of the candidate in the list of response candidates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
+    /// Details the reason why the model stopped generating tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_message: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -666,8 +702,19 @@ pub struct GenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_schema: Option<Value>,
 
+    /// Alternative JSON Schema format accepted by the Gemini API.
+    #[serde(
+        rename = "_responseJsonSchema",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_json_schema_compat: Option<Value>,
+
+    /// JSON Schema format accepted by the Gemini API.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_modalities: Option<Vec<String>>,
+    pub response_json_schema: Option<Value>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_modalities: Option<Vec<Modality>>,
 
     /// Number of generated responses to return. Currently, this value can only be set to 1. If
     /// unset, this will default to 1.
@@ -701,6 +748,10 @@ pub struct GenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
 
+    /// Seed used in decoding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i32>,
+
     /// Presence penalty applied to the next token's logprobs if the token has already been seen in the response.
     /// This penalty is binary on/off and not dependent on the number of times the token is used (after the first).
     /// Use frequencyPenalty for a penalty that increases with each use. A positive penalty will discourage the use
@@ -728,9 +779,21 @@ pub struct GenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<i32>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_enhanced_civic_answers: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speech_config: Option<SpeechConfig>,
+
     /// Configuration for thinking/reasoning.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<ThinkingConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_config: Option<ImageConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_resolution: Option<MediaResolution>,
 }
 
 impl Default for GenerationConfig {
@@ -741,15 +804,22 @@ impl Default for GenerationConfig {
             stop_sequences: None,
             response_mime_type: None,
             response_schema: None,
+            response_json_schema_compat: None,
+            response_json_schema: None,
             response_modalities: None,
             candidate_count: None,
             top_p: None,
             top_k: None,
+            seed: None,
             presence_penalty: None,
             frequency_penalty: None,
             response_logprobs: None,
             logprobs: None,
+            enable_enhanced_civic_answers: None,
+            speech_config: None,
             thinking_config: None,
+            image_config: None,
+            media_resolution: None,
         }
     }
 }
@@ -767,8 +837,457 @@ pub struct FunctionDeclaration {
     pub response: Option<Value>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_stage: Option<ModelStage>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retirement_time: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ModelStage {
+    #[default]
+    ModelStageUnspecified,
+    UnstableExperimental,
+    Experimental,
+    Preview,
+    Stable,
+    Legacy,
+    Deprecated,
+    Retired,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Modality {
+    #[default]
+    ModalityUnspecified,
+    Text,
+    Image,
+    Audio,
+    Video,
+    Document,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundingAttribution {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<AttributionSourceId>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Content>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttributionSourceId {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grounding_passage: Option<GroundingPassageId>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_retriever_chunk: Option<SemanticRetrieverChunk>,
+
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundingPassageId {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passage_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part_index: Option<u32>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticRetrieverChunk {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundingMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grounding_chunks: Vec<GroundingChunk>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grounding_supports: Vec<GroundingSupport>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub web_search_queries: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_search_queries: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_entry_point: Option<SearchEntryPoint>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_metadata: Option<RetrievalMetadata>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub google_maps_widget_context_token: Option<String>,
+
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchEntryPoint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered_content: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdk_blob: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundingChunk {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web: Option<Web>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<Image>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieved_context: Option<RetrievedContext>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maps: Option<Maps>,
+
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Web {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Image {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_uri: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_uri: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetrievedContext {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_metadata: Vec<CustomMetadata>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_search_store: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub string_value: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub string_list_value: Option<StringList>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub numeric_value: Option<f64>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StringList {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Maps {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place_answer_sources: Option<PlaceAnswerSources>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaceAnswerSources {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_snippets: Vec<ReviewSnippet>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewSnippet {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub google_maps_uri: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundingSupport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grounding_chunk_indices: Vec<u32>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confidence_scores: Vec<f64>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendered_parts: Vec<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment: Option<Segment>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Segment {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part_index: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_index: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_index: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetrievalMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub google_search_dynamic_retrieval_score: Option<f64>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LogprobsResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_candidates: Vec<TopCandidates>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chosen_candidates: Vec<LogprobCandidate>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_probability_sum: Option<f64>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TopCandidates {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<LogprobCandidate>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LogprobCandidate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<i32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_probability: Option<f64>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlContextMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_metadata: Vec<UrlMetadata>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieved_url: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url_retrieval_status: Option<UrlRetrievalStatus>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UrlRetrievalStatus {
+    #[default]
+    UrlRetrievalStatusUnspecified,
+    UrlRetrievalStatusSuccess,
+    UrlRetrievalStatusError,
+    UrlRetrievalStatusPaywall,
+    UrlRetrievalStatusUnsafe,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModalityTokenCount {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modality: Option<Modality>,
+
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub token_count: u32,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_config: Option<VoiceConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_speaker_voice_config: Option<MultiSpeakerVoiceConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_code: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prebuilt_voice_config: Option<PrebuiltVoiceConfig>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrebuiltVoiceConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_name: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiSpeakerVoiceConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speaker_voice_configs: Vec<SpeakerVoiceConfig>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerVoiceConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_config: Option<VoiceConfig>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MediaResolution {
+    #[default]
+    MediaResolutionUnspecified,
+    MediaResolutionLow,
+    MediaResolutionMedium,
+    MediaResolutionHigh,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    #[default]
+    Unspecified,
+    Standard,
+    Flex,
+    Priority,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SafetySetting {
+    pub category: HarmCategory,
+    pub threshold: HarmBlockThreshold,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HarmBlockThreshold {
+    #[default]
+    HarmBlockThresholdUnspecified,
+    BlockLowAndAbove,
+    BlockMediumAndAbove,
+    BlockOnlyHigh,
+    BlockNone,
+    Off,
+}
+
 /// A set of the feedback metadata the prompt specified in [GenerateContentRequest.contents](GenerateContentRequest).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptFeedback {
     /// Optional. If set, the prompt was blocked and no candidates are returned. Rephrase the prompt.
@@ -776,14 +1295,15 @@ pub struct PromptFeedback {
     pub block_reason: Option<BlockReason>,
     /// Ratings for safety of the prompt. There is at most one rating per category.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub safety_ratings: Option<Vec<SatisfyRating>>,
+    pub safety_ratings: Option<Vec<SafetyRating>>,
 }
 
 /// Reason why a prompt was blocked by the model
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BlockReason {
     /// Default value. This value is unused.
+    #[default]
     BlockReasonUnspecified,
     /// Prompt was blocked due to safety reasons. Inspect safetyRatings to understand which safety category blocked it.
     Safety,
@@ -793,9 +1313,11 @@ pub enum BlockReason {
     Blocklist,
     /// Prompt was blocked due to prohibited content.
     ProhibitedContent,
+    /// Candidates blocked due to unsafe image generation content.
+    ImageSafety,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {
     #[serde(default)]
@@ -815,6 +1337,18 @@ pub struct UsageMetadata {
 
     #[serde(default)]
     pub cached_content_token_count: u32,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_tokens_details: Vec<ModalityTokenCount>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_tokens_details: Vec<ModalityTokenCount>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates_tokens_details: Vec<ModalityTokenCount>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_use_prompt_tokens_details: Vec<ModalityTokenCount>,
 }
 
 /// Config for thinking features.
@@ -880,7 +1414,7 @@ pub struct CitationSource {
 /// classification is included here.
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct SatisfyRating {
+pub struct SafetyRating {
     /// The category for this rating.
     pub category: HarmCategory,
     /// The probability of harm for this content.
@@ -889,6 +1423,8 @@ pub struct SatisfyRating {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<bool>,
 }
+
+pub type SatisfyRating = SafetyRating;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -920,6 +1456,7 @@ pub enum HarmCategory {
     HarmCategoryDerogatory,
     HarmCategoryToxicity,
     HarmCategoryViolence,
+    HarmCategorySexual,
     HarmCategorySexually,
     HarmCategoryMedical,
     HarmCategoryDangerous,
@@ -961,6 +1498,22 @@ pub enum FinishReason {
     /// Token generation stopped because generated images contain safety
     /// violations.
     ImageSafety,
+    /// Image generation stopped because generated images have prohibited content.
+    ImageProhibitedContent,
+    /// Image generation stopped because of another issue.
+    ImageOther,
+    /// The model was expected to generate an image, but none was generated.
+    NoImage,
+    /// Image generation stopped due to recitation.
+    ImageRecitation,
+    /// Model generated a tool call but no tools were enabled in the request.
+    UnexpectedToolCall,
+    /// Model called too many tools consecutively.
+    TooManyToolCalls,
+    /// Request has at least one thought signature missing.
+    MissingThoughtSignature,
+    /// Finished due to malformed response.
+    MalformedResponse,
 }
 
 #[cfg(test)]
@@ -1188,6 +1741,308 @@ mod tests {
 
         // let val = into_parts(json!(vec![string_value, complex_value])).unwrap();
         // assert_eq!(val, vec![content_part, content_part2]);
+    }
+
+    #[test]
+    fn test_generate_content_request_serde() {
+        let mut req = GenerateContentRequest::default();
+        req.contents.push(json!({
+            "role": "user",
+            "parts": [{"text": "Hello"}]
+        }));
+        req.safety_settings.push(SafetySetting {
+            category: HarmCategory::HarmCategoryHarassment,
+            threshold: HarmBlockThreshold::BlockOnlyHigh,
+        });
+        req.cached_content = Some("cachedContents/abc".to_string());
+        req.service_tier = Some(ServiceTier::Priority);
+        req.store = Some(false);
+        req.generation_config.response_modalities = Some(vec![Modality::Text, Modality::Image]);
+        req.generation_config.response_json_schema = Some(json!({"type": "object"}));
+        req.generation_config.seed = Some(42);
+        req.generation_config.enable_enhanced_civic_answers = Some(true);
+        req.generation_config.speech_config = Some(SpeechConfig {
+            voice_config: Some(VoiceConfig {
+                prebuilt_voice_config: Some(PrebuiltVoiceConfig {
+                    voice_name: Some("Kore".to_string()),
+                }),
+            }),
+            language_code: Some("en-US".to_string()),
+            ..Default::default()
+        });
+        req.generation_config.image_config = Some(ImageConfig {
+            aspect_ratio: Some("16:9".to_string()),
+            image_size: Some("1K".to_string()),
+        });
+        req.generation_config.media_resolution = Some(MediaResolution::MediaResolutionHigh);
+
+        let json_value = serde_json::to_value(&req).unwrap();
+        assert_eq!(json_value["cachedContent"], "cachedContents/abc");
+        assert_eq!(json_value["serviceTier"], "priority");
+        assert_eq!(json_value["store"], false);
+        assert_eq!(
+            json_value["safetySettings"],
+            json!([{ "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH" }])
+        );
+        assert_eq!(
+            json_value["generationConfig"]["responseModalities"],
+            json!(["TEXT", "IMAGE"])
+        );
+        assert_eq!(
+            json_value["generationConfig"]["responseJsonSchema"],
+            json!({"type": "object"})
+        );
+        assert_eq!(json_value["generationConfig"]["seed"], 42);
+        assert_eq!(
+            json_value["generationConfig"]["enableEnhancedCivicAnswers"],
+            true
+        );
+        assert_eq!(
+            json_value["generationConfig"]["speechConfig"],
+            json!({
+                "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}},
+                "languageCode": "en-US"
+            })
+        );
+        assert_eq!(
+            json_value["generationConfig"]["imageConfig"],
+            json!({"aspectRatio": "16:9", "imageSize": "1K"})
+        );
+        assert_eq!(
+            json_value["generationConfig"]["mediaResolution"],
+            "MEDIA_RESOLUTION_HIGH"
+        );
+
+        let deserialized: GenerateContentRequest = serde_json::from_value(json_value).unwrap();
+        assert_eq!(
+            deserialized.safety_settings[0].category,
+            HarmCategory::HarmCategoryHarassment
+        );
+        assert_eq!(deserialized.service_tier, Some(ServiceTier::Priority));
+        assert_eq!(
+            deserialized.generation_config.response_modalities,
+            Some(vec![Modality::Text, Modality::Image])
+        );
+    }
+
+    #[test]
+    fn test_generate_content_response_core_metadata_serde() {
+        let json_value = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "Grounded answer"}]
+                },
+                "finishReason": "STOP",
+                "safetyRatings": [{
+                    "category": "HARM_CATEGORY_HARASSMENT",
+                    "probability": "LOW",
+                    "blocked": false
+                }],
+                "citationMetadata": {
+                    "citationSources": [{
+                        "startIndex": 0,
+                        "endIndex": 8,
+                        "uri": "https://example.com",
+                        "license": "MIT"
+                    }]
+                },
+                "tokenCount": 12,
+                "groundingAttributions": [{
+                    "sourceId": {
+                        "groundingPassage": {"passageId": "p1", "partIndex": 0}
+                    },
+                    "content": {"parts": [{"text": "source text"}]}
+                }],
+                "groundingMetadata": {
+                    "groundingChunks": [{
+                        "web": {"uri": "https://example.com", "title": "Example"}
+                    }, {
+                        "retrievedContext": {
+                            "customMetadata": [{
+                                "key": "kind",
+                                "stringListValue": {"values": ["doc", "faq"]},
+                                "numericValue": 0.8
+                            }],
+                            "uri": "fileSearchStores/1/documents/a",
+                            "title": "Doc",
+                            "text": "snippet",
+                            "fileSearchStore": "fileSearchStores/1"
+                        }
+                    }, {
+                        "maps": {
+                            "uri": "https://maps.example/place",
+                            "title": "Cafe",
+                            "text": "Open now",
+                            "placeId": "places/abc",
+                            "placeAnswerSources": {
+                                "reviewSnippets": [{
+                                    "reviewId": "r1",
+                                    "googleMapsUri": "https://maps.example/review",
+                                    "title": "Helpful review"
+                                }]
+                            }
+                        }
+                    }],
+                    "groundingSupports": [{
+                        "groundingChunkIndices": [0],
+                        "confidenceScores": [0.9],
+                        "renderedParts": [0],
+                        "segment": {
+                            "partIndex": 0,
+                            "startIndex": 0,
+                            "endIndex": 8,
+                            "text": "Grounded"
+                        }
+                    }],
+                    "webSearchQueries": ["grounding query"],
+                    "imageSearchQueries": ["image query"],
+                    "searchEntryPoint": {
+                        "renderedContent": "<div></div>",
+                        "sdkBlob": "W10="
+                    },
+                    "retrievalMetadata": {"googleSearchDynamicRetrievalScore": 0.75},
+                    "googleMapsWidgetContextToken": "maps-token"
+                },
+                "avgLogprobs": -0.12,
+                "logprobsResult": {
+                    "topCandidates": [{
+                        "candidates": [{"token": "Hello", "tokenId": 1, "logProbability": -0.1}]
+                    }],
+                    "chosenCandidates": [{"token": "Hello", "tokenId": 1, "logProbability": -0.1}],
+                    "logProbabilitySum": -0.1
+                },
+                "urlContextMetadata": {
+                    "urlMetadata": [{
+                        "retrievedUrl": "https://example.com",
+                        "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"
+                    }]
+                },
+                "index": 0,
+                "finishMessage": "done"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "cachedContentTokenCount": 2,
+                "candidatesTokenCount": 5,
+                "toolUsePromptTokenCount": 1,
+                "thoughtsTokenCount": 3,
+                "totalTokenCount": 19,
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 10}],
+                "cacheTokensDetails": [{"modality": "DOCUMENT", "tokenCount": 2}],
+                "candidatesTokensDetails": [{"modality": "TEXT", "tokenCount": 5}],
+                "toolUsePromptTokensDetails": [{"modality": "TEXT", "tokenCount": 1}]
+            },
+            "modelVersion": "gemini-2.5-flash",
+            "responseId": "response-1",
+            "modelStatus": {
+                "modelStage": "STABLE",
+                "retirementTime": "2026-12-31T00:00:00Z",
+                "message": "ok"
+            }
+        });
+
+        let response: GenerateContentResponse = serde_json::from_value(json_value.clone()).unwrap();
+        assert_eq!(
+            response.model_status.as_ref().unwrap().model_stage.as_ref(),
+            Some(&ModelStage::Stable)
+        );
+        assert_eq!(
+            response.usage_metadata.prompt_tokens_details[0]
+                .modality
+                .as_ref(),
+            Some(&Modality::Text)
+        );
+
+        let candidate = &response.candidates[0];
+        assert_eq!(candidate.finish_reason.as_ref(), Some(&FinishReason::Stop));
+        assert_eq!(
+            &candidate.safety_ratings.as_ref().unwrap()[0].probability,
+            &HarmProbability::Low
+        );
+        assert_eq!(
+            candidate.grounding_attributions[0]
+                .source_id
+                .as_ref()
+                .unwrap()
+                .grounding_passage
+                .as_ref()
+                .unwrap()
+                .passage_id
+                .as_deref(),
+            Some("p1")
+        );
+        assert_eq!(
+            candidate
+                .grounding_metadata
+                .as_ref()
+                .unwrap()
+                .grounding_chunks
+                .len(),
+            3
+        );
+        assert_eq!(
+            candidate
+                .logprobs_result
+                .as_ref()
+                .unwrap()
+                .chosen_candidates[0]
+                .token
+                .as_deref(),
+            Some("Hello")
+        );
+        assert_eq!(
+            candidate
+                .url_context_metadata
+                .as_ref()
+                .unwrap()
+                .url_metadata[0]
+                .url_retrieval_status
+                .as_ref(),
+            Some(&UrlRetrievalStatus::UrlRetrievalStatusSuccess)
+        );
+        assert_eq!(candidate.finish_message.as_deref(), Some("done"));
+
+        assert_eq!(serde_json::to_value(response).unwrap(), json_value);
+    }
+
+    #[test]
+    fn test_prompt_feedback_and_legacy_safety_alias() {
+        let response: GenerateContentResponse = serde_json::from_value(json!({
+            "promptFeedback": {
+                "blockReason": "IMAGE_SAFETY",
+                "safetyRatings": [{
+                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "probability": "HIGH",
+                    "blocked": true
+                }]
+            },
+            "usageMetadata": {}
+        }))
+        .unwrap();
+        assert!(response.candidates.is_empty());
+        let feedback = response.prompt_feedback.unwrap();
+        assert_eq!(
+            feedback.block_reason.as_ref(),
+            Some(&BlockReason::ImageSafety)
+        );
+        assert_eq!(
+            &feedback.safety_ratings.unwrap()[0].category,
+            &HarmCategory::HarmCategoryDangerousContent
+        );
+
+        let candidate: Candidate = serde_json::from_value(json!({
+            "content": {"parts": [{"text": "legacy"}]},
+            "satefyRatings": [{
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "probability": "MEDIUM"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            &candidate.safety_ratings.unwrap()[0].category,
+            &HarmCategory::HarmCategoryHateSpeech
+        );
     }
 
     #[test]

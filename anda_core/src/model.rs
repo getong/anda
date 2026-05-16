@@ -11,7 +11,10 @@
 use candid::Principal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, json};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    str::FromStr,
+};
 
 use crate::Json;
 pub use ic_auth_types::{ByteArrayB64, ByteBufB64, Xid};
@@ -391,6 +394,39 @@ pub fn part_to_data_url(data: &ByteBufB64, mime_type: Option<&String>) -> String
     )
 }
 
+/// Parses a data URL string and extracts the inline data and MIME type, if applicable.
+pub fn inline_data_from_data_url(data_url: &str) -> Option<(ByteBufB64, String)> {
+    if let Some(stripped) = data_url.strip_prefix("data:") {
+        let (meta, data_part) = stripped.split_once(",")?;
+
+        if meta.ends_with(";base64") {
+            if let Ok(data) = ByteBufB64::from_str(data_part) {
+                let mime_type = meta
+                    .strip_suffix(";base64")
+                    .map(|s| s.to_string())
+                    .or_else(|| infer2::get(&data).map(|t| t.mime_type().to_string()));
+                Some((
+                    data,
+                    mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                ))
+            } else {
+                None
+            }
+        } else {
+            let data = decode_percent_encoded_bytes(data_part)?;
+            Some((data, meta.to_string()))
+        }
+    } else if let Ok(data) = ByteBufB64::from_str(data_url) {
+        let mime_type = infer2::get(&data).map(|t| t.mime_type().to_string());
+        Some((
+            data,
+            mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+        ))
+    } else {
+        None
+    }
+}
+
 impl<'de> Deserialize<'de> for ContentPart {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -529,27 +565,38 @@ impl From<Json> for ContentPart {
     }
 }
 
-impl From<Resource> for ContentPart {
-    fn from(res: Resource) -> Self {
-        if let Some(data) = res.blob {
+impl TryFrom<Resource> for ContentPart {
+    type Error = Resource;
+    fn try_from(res: Resource) -> Result<Self, Self::Error> {
+        if res.blob.as_ref().map(|v| !v.0.is_empty()).unwrap_or(false)
+            && let Some(data) = res.blob
+        {
             match String::from_utf8(data.0) {
-                Ok(text) => ContentPart::Text { text },
-                Err(v) => ContentPart::InlineData {
-                    mime_type: res
-                        .mime_type
-                        .unwrap_or_else(|| "application/octet-stream".to_string()),
-                    data: v.into_bytes().into(),
-                },
+                Ok(text) => Ok(ContentPart::Text { text }),
+                Err(v) => {
+                    let data: ByteBufB64 = v.into_bytes().into();
+                    let mime_type = res.mime_type.unwrap_or_else(|| {
+                        infer2::get(&data)
+                            .map(|t| t.mime_type())
+                            .unwrap_or("application/octet-stream")
+                            .to_string()
+                    });
+                    Ok(ContentPart::InlineData { mime_type, data })
+                }
             }
-        } else if let Some(file_uri) = res.uri {
-            ContentPart::FileData {
+        } else if res
+            .uri
+            .as_ref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+            && let Some(file_uri) = res.uri
+        {
+            Ok(ContentPart::FileData {
                 file_uri,
                 mime_type: res.mime_type,
-            }
+            })
         } else {
-            ContentPart::Text {
-                text: serde_json::to_string(&res).unwrap_or_default(),
-            }
+            Err(res)
         }
     }
 }
@@ -931,9 +978,413 @@ pub fn text_resource_documents(resources: &mut Vec<Resource>) -> Vec<Document> {
     user_resources
 }
 
+fn decode_percent_encoded_bytes(input: &str) -> Option<ByteBufB64> {
+    fn decode_hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hi = *bytes.get(index + 1)?;
+                let lo = *bytes.get(index + 2)?;
+                decoded.push((decode_hex(hi)? << 4) | decode_hex(lo)?);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    Some(decoded.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resource(id: u64, tags: &[&str]) -> Resource {
+        Resource {
+            _id: id,
+            name: format!("resource-{id}"),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_agent_and_tool_constructors_default_optional_fields() {
+        let agent = AgentInput::new("planner".into(), "summarize this".into());
+        assert_eq!(agent.name, "planner");
+        assert_eq!(agent.prompt, "summarize this");
+        assert!(agent.resources.is_empty());
+        assert!(agent.topics.is_none());
+        assert!(agent.meta.is_none());
+
+        let tool = ToolInput::new("sum".into(), json!({"x": 1, "y": 2}));
+        assert_eq!(tool.name, "sum");
+        assert_eq!(tool.args, json!({"x": 1, "y": 2}));
+        assert!(tool.resources.is_empty());
+        assert!(tool.meta.is_none());
+
+        let output = ToolOutput::new(json!("ok"));
+        assert_eq!(output.output, json!("ok"));
+        assert!(output.artifacts.is_empty());
+        assert_eq!(output.usage.requests, 0);
+        assert!(output.tools_usage.is_empty());
+    }
+
+    #[test]
+    fn test_prompt_command_from_string_variants() {
+        assert_eq!(PromptCommand::from("".to_string()), PromptCommand::Ping);
+        assert_eq!(
+            PromptCommand::from("  /PING  ".to_string()),
+            PromptCommand::Ping
+        );
+        assert_eq!(
+            PromptCommand::from("hello".to_string()),
+            PromptCommand::Plain {
+                prompt: "hello".into(),
+            }
+        );
+        assert_eq!(
+            PromptCommand::from("/Status  show details".to_string()),
+            PromptCommand::Command {
+                command: "status".into(),
+                prompt: "/Status  show details".into(),
+            }
+        );
+        assert_eq!(
+            PromptCommand::from("/help".to_string()),
+            PromptCommand::Command {
+                command: "help".into(),
+                prompt: "/help".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_agent_output_into_tool_output_handles_json_plain_text_and_metadata() {
+        let mut tools_usage = HashMap::new();
+        tools_usage.insert(
+            "sum".into(),
+            Usage {
+                requests: 1,
+                ..Default::default()
+            },
+        );
+
+        let output = AgentOutput {
+            content: r#"{"ok":true}"#.into(),
+            usage: Usage {
+                input_tokens: 2,
+                output_tokens: 1,
+                requests: 1,
+                ..Default::default()
+            },
+            tools_usage: tools_usage.clone(),
+            artifacts: vec![resource(7, &["text"])],
+            ..Default::default()
+        }
+        .into_tool_output();
+        assert_eq!(output.output, json!({"ok": true}));
+        assert_eq!(output.artifacts.len(), 1);
+        assert_eq!(output.artifacts[0]._id, 7);
+        assert_eq!(output.usage.input_tokens, 2);
+        assert_eq!(output.tools_usage.get("sum").unwrap().requests, 1);
+
+        let output = AgentOutput {
+            content: "not-json".into(),
+            thoughts: Some("thinking".into()),
+            session: Some("session-1".into()),
+            model: Some("test-model".into()),
+            ..Default::default()
+        }
+        .into_tool_output();
+        assert_eq!(
+            output.output,
+            json!({
+                "content": "not-json",
+                "thoughts": "thinking",
+                "session": "session-1",
+                "model": "test-model"
+            })
+        );
+
+        let output = AgentOutput {
+            content: "still-not-json".into(),
+            ..Default::default()
+        }
+        .into_tool_output();
+        assert_eq!(output.output, json!("still-not-json"));
+    }
+
+    #[test]
+    fn test_data_url_helpers_round_trip_and_invalid_inputs() {
+        let data: ByteBufB64 = b"hello".to_vec().into();
+        let mime_type = "text/plain".to_string();
+
+        let data_url = part_to_data_url(&data, Some(&mime_type));
+        assert_eq!(data_url, "data:text/plain;base64,aGVsbG8=");
+
+        let (decoded, decoded_mime_type) = inline_data_from_data_url(&data_url).unwrap();
+        assert_eq!(decoded, data);
+        assert_eq!(decoded_mime_type, "text/plain");
+
+        let (decoded, _) = inline_data_from_data_url("aGVsbG8=").unwrap();
+        assert_eq!(decoded, data);
+
+        let html_url = "data:text/html,%3Ch1%3EHello%2C%20World%21%3C%2Fh1%3E";
+        let (decoded, decoded_mime_type) = inline_data_from_data_url(html_url).unwrap();
+        let expected_html: ByteBufB64 = b"<h1>Hello, World!</h1>".to_vec().into();
+        assert_eq!(decoded, expected_html);
+        assert_eq!(decoded_mime_type, "text/html");
+
+        let (decoded, decoded_mime_type) =
+            inline_data_from_data_url("data:text/plain,hello").unwrap();
+        let expected_text: ByteBufB64 = b"hello".to_vec().into();
+        assert_eq!(decoded, expected_text);
+        assert_eq!(decoded_mime_type, "text/plain");
+
+        assert!(inline_data_from_data_url("data:text/plain,%GG").is_none());
+        assert!(inline_data_from_data_url("not-base64%%%").is_none());
+    }
+
+    #[test]
+    fn test_content_part_try_from_resource_variants() {
+        let text = Resource {
+            blob: Some(b"hello".to_vec().into()),
+            ..resource(1, &["text"])
+        };
+        assert_eq!(
+            ContentPart::try_from(text).unwrap(),
+            ContentPart::Text {
+                text: "hello".into(),
+            }
+        );
+
+        let binary = Resource {
+            blob: Some(vec![0xff, 0xd8, 0xff].into()),
+            mime_type: Some("image/jpeg".into()),
+            ..resource(2, &["image"])
+        };
+        assert_eq!(
+            ContentPart::try_from(binary).unwrap(),
+            ContentPart::InlineData {
+                mime_type: "image/jpeg".into(),
+                data: vec![0xff, 0xd8, 0xff].into(),
+            }
+        );
+
+        let file = Resource {
+            uri: Some("file:///tmp/a.txt".into()),
+            mime_type: Some("text/plain".into()),
+            ..resource(3, &["text"])
+        };
+        assert_eq!(
+            ContentPart::try_from(file).unwrap(),
+            ContentPart::FileData {
+                file_uri: "file:///tmp/a.txt".into(),
+                mime_type: Some("text/plain".into()),
+            }
+        );
+
+        let empty_blob = Resource {
+            blob: Some(Vec::<u8>::new().into()),
+            ..resource(4, &["text"])
+        };
+        assert!(ContentPart::try_from(empty_blob).is_err());
+
+        let empty_uri = Resource {
+            uri: Some("   ".into()),
+            ..resource(5, &["text"])
+        };
+        assert!(ContentPart::try_from(empty_uri).is_err());
+    }
+
+    #[test]
+    fn test_request_meta_get_extra_as_and_usage_accumulate() {
+        let mut extra = Map::new();
+        extra.insert("numbers".into(), json!([1, 2, 3]));
+        extra.insert("flag".into(), json!(true));
+        let meta = RequestMeta {
+            extra,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            meta.get_extra_as::<Vec<u64>>("numbers"),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(meta.get_extra_as::<bool>("flag"), Some(true));
+        assert_eq!(meta.get_extra_as::<String>("missing"), None);
+
+        let mut usage = Usage {
+            input_tokens: u64::MAX - 1,
+            output_tokens: 2,
+            cached_tokens: 3,
+            requests: u64::MAX,
+        };
+        let other = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cached_tokens: u64::MAX,
+            requests: 1,
+        };
+        usage.accumulate(&other);
+
+        assert_eq!(usage.input_tokens, u64::MAX);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cached_tokens, u64::MAX);
+        assert_eq!(usage.requests, u64::MAX);
+    }
+
+    #[test]
+    fn test_function_definition_and_document_helpers() {
+        let definition = FunctionDefinition {
+            name: "search".into(),
+            description: "Find documents".into(),
+            parameters: json!({"type": "object"}),
+            strict: Some(true),
+        }
+        .name_with_prefix("tool_");
+        assert_eq!(definition.name, "tool_search");
+        assert_eq!(definition.description, "Find documents");
+        assert_eq!(estimate_tokens("abcdef"), 2);
+        assert_eq!(estimate_tokens(""), 0);
+
+        let text_doc = Document::from_text("doc-1", "hello");
+        assert_eq!(text_doc.metadata.get("id"), Some(&json!("doc-1")));
+        assert_eq!(text_doc.metadata.get("type"), Some(&json!("Text")));
+        assert_eq!(text_doc.content, json!("hello"));
+
+        let resource = Resource {
+            _id: 9,
+            name: "note".into(),
+            tags: vec!["text".into()],
+            uri: Some("file:///tmp/note.txt".into()),
+            blob: Some(b"hello".to_vec().into()),
+            mime_type: Some("text/plain".into()),
+            ..Default::default()
+        };
+        let doc = Document::from(&resource);
+        assert_eq!(doc.metadata.get("id"), Some(&json!(9)));
+        assert_eq!(doc.metadata.get("type"), Some(&json!("Resource")));
+        assert_eq!(doc.metadata.get("_id"), Some(&json!(9)));
+        assert_eq!(
+            doc.metadata.get("uri"),
+            Some(&json!("file:///tmp/note.txt"))
+        );
+        assert!(!doc.metadata.contains_key("blob"));
+        assert_eq!(doc.content, Json::Null);
+    }
+
+    #[test]
+    fn test_documents_and_resource_prompt_helpers() {
+        let mut docs = Documents::new(
+            "attachments".into(),
+            vec![Document::from_text("1", "alpha")],
+        );
+        assert_eq!(docs.tag(), "attachments");
+        docs.append(Document::from_text("2", "beta"));
+        assert_eq!(docs.len(), 2);
+
+        let message = docs.to_message("2026-05-16T00:00:00Z").unwrap();
+        assert_eq!(message.role, "user");
+        assert_eq!(message.name.as_deref(), Some("$system"));
+        let text = message.text().unwrap();
+        assert!(text.contains("Current Datetime: 2026-05-16T00:00:00Z"));
+        assert!(text.contains("<attachments>"));
+        assert!(text.contains("alpha"));
+        assert!(text.contains("beta"));
+
+        assert!(
+            Documents::default()
+                .to_message("2026-05-16T00:00:00Z")
+                .is_none()
+        );
+
+        let from_strings: Documents = vec!["alpha".to_string(), "beta".to_string()].into();
+        assert_eq!(
+            from_strings[0],
+            Document {
+                metadata: BTreeMap::from([
+                    ("_id".to_string(), json!(0)),
+                    ("type".to_string(), json!("Text")),
+                ]),
+                content: json!("alpha"),
+            }
+        );
+        assert_eq!(
+            from_strings[1],
+            Document {
+                metadata: BTreeMap::from([
+                    ("_id".to_string(), json!(1)),
+                    ("type".to_string(), json!("Text")),
+                ]),
+                content: json!("beta"),
+            }
+        );
+
+        let mut resources = vec![
+            Resource {
+                blob: Some(b"alpha".to_vec().into()),
+                ..resource(1, &["text"])
+            },
+            Resource {
+                blob: Some(vec![0xff, 0xfe].into()),
+                ..resource(2, &["md"])
+            },
+            Resource {
+                uri: Some("file:///tmp/image.png".into()),
+                ..resource(3, &["image"])
+            },
+        ];
+
+        let docs = text_resource_documents(&mut resources);
+        assert_eq!(docs, vec![Document::from_text("1", "alpha")]);
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]._id, 3);
+
+        let mut prompt_resources = vec![Resource {
+            blob: Some(b"beta".to_vec().into()),
+            ..resource(4, &["text"])
+        }];
+        let prompt = prompt_with_resources("Base prompt".into(), &mut prompt_resources);
+        assert!(prompt.starts_with("Base prompt\n\n<attachments>"));
+        assert!(prompt.contains("beta"));
+        assert!(prompt_resources.is_empty());
+
+        let mut untouched_resources = vec![Resource {
+            uri: Some("file:///tmp/only-image.png".into()),
+            ..resource(5, &["image"])
+        }];
+        let prompt = prompt_with_resources("Base prompt".into(), &mut untouched_resources);
+        assert_eq!(prompt, "Base prompt");
+        assert_eq!(untouched_resources.len(), 1);
+        assert_eq!(untouched_resources[0]._id, 5);
+    }
+
+    #[test]
+    fn test_message_content_deserialize_rejects_non_string_non_array() {
+        assert!(
+            serde_json::from_value::<Message>(json!({
+                "role": "user",
+                "content": 123,
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_prompt() {

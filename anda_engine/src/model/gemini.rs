@@ -6,10 +6,10 @@
 //! - Response parsing and conversion to Anda's internal formats
 
 use anda_core::{
-    AgentOutput, BoxError, BoxPinFut, CompletionFeatures, CompletionRequest, Json, Message,
-    Resource,
+    AgentOutput, BoxError, BoxPinFut, CompletionFeatures, CompletionRequest, Message, Resource,
 };
 use log::{Level::Debug, log_enabled};
+use serde_json::json;
 
 use super::{CompletionFeaturesDyn, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
@@ -139,15 +139,14 @@ impl CompletionFeaturesDyn for CompletionModel {
     fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
-        let mut greq = self.default_request.clone();
+        let mut r = self.default_request.clone();
 
         Box::pin(async move {
             let timestamp = unix_ms();
-            let mut raw_history: Vec<Json> = Vec::new();
             let mut chat_history: Vec<Message> = Vec::new();
 
             if !req.instructions.is_empty() {
-                greq.system_instruction = Some(types::Content {
+                r.system_instruction = Some(types::Content {
                     role: Some(types::Role::Model),
                     parts: vec![types::Part {
                         data: types::PartKind::Text(req.instructions),
@@ -156,12 +155,12 @@ impl CompletionFeaturesDyn for CompletionModel {
                 });
             };
 
-            greq.contents.append(&mut req.raw_history);
+            r.contents.append(&mut req.raw_history);
+            let skip_raw = r.contents.len();
             for msg in req.chat_history {
                 let val = types::Content::from(msg);
                 let val = serde_json::to_value(val)?;
-                raw_history.push(val.clone());
-                greq.contents.push(val);
+                r.contents.push(val);
             }
 
             if let Some(mut msg) = req
@@ -172,8 +171,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                 chat_history.push(msg.clone());
                 let val = types::Content::from(msg);
                 let val = serde_json::to_value(val)?;
-                raw_history.push(val.clone());
-                greq.contents.push(val);
+                r.contents.push(val);
             }
 
             let mut content = req.content;
@@ -191,45 +189,44 @@ impl CompletionFeaturesDyn for CompletionModel {
                 chat_history.push(msg.clone());
                 let val = types::Content::from(msg);
                 let val = serde_json::to_value(val)?;
-                raw_history.push(val.clone());
-                greq.contents.push(val);
+                r.contents.push(val);
             }
 
             if let Some(temperature) = req.temperature {
-                greq.generation_config.temperature = Some(temperature);
+                r.generation_config.temperature = Some(temperature);
             }
 
             if let Some(max_tokens) = req.max_output_tokens {
-                greq.generation_config.max_output_tokens = Some(max_tokens as i32);
+                r.generation_config.max_output_tokens = Some(max_tokens as i32);
             }
 
             if let Some(output_schema) = req.output_schema {
-                greq.generation_config.response_mime_type = Some("application/json".to_string());
-                greq.generation_config.response_schema = Some(output_schema);
+                r.generation_config.response_mime_type = Some("application/json".to_string());
+                r.generation_config.response_schema = Some(output_schema);
             }
 
             if let Some(stop) = req.stop {
-                greq.generation_config.stop_sequences = Some(stop);
+                r.generation_config.stop_sequences = Some(stop);
             }
 
             if !req.tools.is_empty() {
-                greq.tools = vec![req.tools.into()];
-                greq.tool_config = Some(types::ToolConfig::default());
+                r.tools = vec![req.tools.into()];
+                r.tool_config = Some(types::ToolConfig::default());
             };
 
             if log_enabled!(Debug)
-                && let Ok(val) = serde_json::to_string(&greq)
+                && let Ok(val) = serde_json::to_string(&r)
             {
                 log::debug!(request = val; "Completion request");
             }
 
             let response = client
                 .post(&format!("/{}:generateContent", model))
-                .json(&greq)
+                .json(&r)
                 .send()
                 .await?;
 
-            greq.system_instruction = None; // avoid logging tedious instructions
+            r.system_instruction = None; // avoid logging tedious instructions
             if response.status().is_success() {
                 let text = response.text().await?;
 
@@ -238,20 +235,24 @@ impl CompletionFeaturesDyn for CompletionModel {
                         if log_enabled!(Debug) {
                             log::debug!(
                                 model = model,
-                                request:serde = greq,
-                                messages:serde = raw_history,
+                                request:serde = r,
                                 response:serde = res;
                                 "Completion response");
                         } else if res.maybe_failed() {
                             log::warn!(
                                 model = model,
-                                request:serde = greq,
-                                messages:serde = raw_history,
+                                request:serde = r,
                                 response:serde = res;
                                 "Completion maybe failed");
                         }
+                        if skip_raw > 0 {
+                            r.contents.drain(0..skip_raw);
+                        }
 
-                        res.try_into(raw_history, chat_history)
+                        res.try_into(
+                            r.contents.into_iter().map(|v| json!(v)).collect(),
+                            chat_history,
+                        )
                     }
                     Err(err) => Err(format!(
                         "Invalid completion response, model: {}, error: {}, body: {}",
@@ -264,8 +265,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                 let msg = response.text().await?;
                 log::error!(
                     model = model,
-                    request:serde = greq,
-                    messages:serde = raw_history;
+                    request:serde = r;
                     "Completion request failed: {status}, body: {msg}",
                 );
                 Err(format!(
