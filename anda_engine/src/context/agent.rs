@@ -991,8 +991,8 @@ pub struct CompletionRunner {
     total_usage: Usage,
     current_usage: Usage,
     artifacts: Vec<Resource>,
-    steering_message: Vec<String>,
-    follow_up_message: VecDeque<String>,
+    steering_message: Vec<ContentPart>,
+    follow_up_message: VecDeque<ContentPart>,
     pending_tool_calls: Vec<ToolCall>,
     tools_usage: HashMap<String, Usage>,
     last_output: Option<AgentOutput>,
@@ -1088,15 +1088,25 @@ impl CompletionRunner {
     /// Queue a steering message to interrupt the agent mid-run.
     /// Delivered after current tool execution, skips remaining tools.
     /// No effect if the completion has finished.
-    pub fn steer(&mut self, message: String) {
-        self.steering_message.push(message);
+    pub fn steer(&mut self, message: impl Into<ContentPart>) {
+        self.steering_message.push(message.into());
+    }
+
+    /// Queue a steering message with multiple content parts to interrupt the agent mid-run.
+    pub fn steer_content(&mut self, content: Vec<ContentPart>) {
+        self.steering_message.extend(content);
     }
 
     /// Queue a follow-up message to be processed after the agent finishes.
     /// Delivered only when agent has no more tool calls or steering messages.
     /// No effect if the completion has finished.
-    pub fn follow_up(&mut self, message: String) {
-        self.follow_up_message.push_back(message);
+    pub fn follow_up(&mut self, message: impl Into<ContentPart>) {
+        self.follow_up_message.push_back(message.into());
+    }
+
+    /// Queue a follow-up message with multiple content parts to be processed after the agent finishes.
+    pub fn follow_up_content(&mut self, content: Vec<ContentPart>) {
+        self.follow_up_message.extend(content);
     }
 
     /// Accumulate usage from an intermediate step into the runner's total usage.
@@ -1116,30 +1126,26 @@ impl CompletionRunner {
 
     // Drains all queued steering messages into a single user turn. When steering exists, queued
     // follow-up messages are prepended so the next round sees one combined instruction.
-    fn drain_steering_message(&mut self) -> Option<String> {
+    fn drain_steering_message(&mut self) -> Option<Vec<ContentPart>> {
         if self.steering_message.is_empty() {
             None
         } else {
             // Follow-up messages are placed before steering messages to preserve the deferred user
             // intent when an operator also injects steering.
-            let mut msgs: Vec<String> = self.follow_up_message.drain(..).collect();
+            let mut msgs: Vec<ContentPart> = self.follow_up_message.drain(..).collect();
             msgs.append(&mut self.steering_message);
-            Some(msgs.join("\n\n"))
+            Some(msgs)
         }
     }
 
-    fn drain_queued_message(&mut self) -> Option<String> {
-        let mut msgs: Vec<String> = self.follow_up_message.drain(..).collect();
+    fn drain_queued_message(&mut self) -> Option<Vec<ContentPart>> {
+        let mut msgs: Vec<ContentPart> = self.follow_up_message.drain(..).collect();
         msgs.append(&mut self.steering_message);
-        if msgs.is_empty() {
-            None
-        } else {
-            Some(msgs.join("\n\n"))
-        }
+        if msgs.is_empty() { None } else { Some(msgs) }
     }
 
-    fn set_next_user_prompt(&mut self, prompt: String) {
-        self.req.prompt = prompt;
+    fn set_next_user_content(&mut self, content: Vec<ContentPart>) {
+        self.req.content = content;
         self.req.role = Some("user".to_string());
     }
 
@@ -1182,15 +1188,15 @@ impl CompletionRunner {
         self.unbound = false;
 
         if let Some(prompt) = prompt {
-            self.follow_up_message.push_back(prompt);
+            self.follow_up_message.push_back(prompt.into());
         }
 
         if self.req.prompt.is_empty()
             && self.req.content.is_empty()
             && self.pending_tool_calls.is_empty()
         {
-            if let Some(prompt) = self.drain_queued_message() {
-                self.set_next_user_prompt(prompt);
+            if let Some(content) = self.drain_queued_message() {
+                self.set_next_user_content(content);
             } else {
                 return Ok(self.final_idle_output());
             }
@@ -1209,19 +1215,14 @@ impl CompletionRunner {
 
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
         if !self.pending_tool_calls.is_empty()
-            && let Some(prompt) = self.drain_steering_message()
+            && let Some(content) = self.drain_steering_message()
         {
             // Drop the raw tool-call assistant turn so the redirected round does not inherit
             // an unfinished tool-call requirement.
             self.req.raw_history.pop();
             // Clear pending tool calls since the operator's steering should take priority and interrupt the current flow, even if there are still pending tool calls.
             self.pending_tool_calls.clear();
-            self.req.content.clear();
-            self.req.prompt = if self.req.prompt.is_empty() {
-                prompt
-            } else {
-                format!("{}\n\n{}", self.req.prompt, prompt)
-            };
+            self.req.content = content;
             self.req.role = Some("user".to_string());
         } else if self.req.prompt.is_empty() && self.req.content.is_empty() {
             // 自动执行工具/代理调用
@@ -1375,8 +1376,8 @@ impl CompletionRunner {
                 if !tool_call_errors.is_empty() {
                     self.req.content.push(tool_call_errors.join("; ").into());
                 }
-            } else if let Some(prompt) = self.drain_queued_message() {
-                self.set_next_user_prompt(prompt);
+            } else if let Some(content) = self.drain_queued_message() {
+                self.set_next_user_content(content);
             } else {
                 return Ok(None);
             }
@@ -1444,7 +1445,7 @@ impl CompletionRunner {
         // Accumulate all generated chat history, excluding the original request history.
         self.chat_history.append(&mut output.chat_history);
 
-        if let Some(prompt) = self.drain_steering_message() {
+        if let Some(content) = self.drain_steering_message() {
             if !output.tool_calls.is_empty() {
                 // Drop the raw tool-call assistant turn so the redirected round does not inherit
                 // an unfinished tool-call requirement.
@@ -1452,7 +1453,7 @@ impl CompletionRunner {
             }
             // Clear pending tool calls since the operator's steering should take priority and interrupt the current flow, even if there are still pending tool calls.
             self.pending_tool_calls.clear();
-            self.set_next_user_prompt(prompt);
+            self.set_next_user_content(content);
             return Ok(Some(self.intermediate_output(output)));
         }
 
@@ -1462,8 +1463,8 @@ impl CompletionRunner {
             return Ok(Some(self.intermediate_output(output)));
         }
 
-        if let Some(prompt) = self.drain_queued_message() {
-            self.set_next_user_prompt(prompt);
+        if let Some(content) = self.drain_queued_message() {
+            self.set_next_user_content(content);
             return Ok(Some(self.intermediate_output(output)));
         }
 
@@ -1622,8 +1623,22 @@ mod tests {
             &self,
             req: CompletionRequest,
         ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            let content = if req.prompt.is_empty() {
+                req.content
+                    .iter()
+                    .map(|part| match part {
+                        anda_core::ContentPart::Text { text }
+                        | anda_core::ContentPart::Reasoning { text } => text.clone(),
+                        _ => serde_json::to_string(part).unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            } else {
+                req.prompt.clone()
+            };
+
             Box::pin(futures::future::ready(Ok(AgentOutput {
-                content: req.prompt.clone(),
+                content,
                 usage: Usage {
                     input_tokens: 5,
                     output_tokens: 10,
