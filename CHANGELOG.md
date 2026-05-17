@@ -2,6 +2,13 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.11] — 2026-05-17
+
+### Fixed — anda_engine v0.12.11
+
+- **`implicit_context` injection timing** — When pending tool calls are executed mid-turn, the implicit context is no longer injected on the same request. Instead it's deferred to the next user-facing turn, preventing implicit context from being consumed on tool-result rounds where it would have no effect.
+- **OpenAI: DeepSeek `tool_choice` compatibility** — Skip setting `tool_choice` for models whose name starts with `"deepseek"`, as DeepSeek's API does not support this parameter and returns errors when it is present.
+
 ## [0.12.10] — 2026-05-17
 
 ### Changed — anda_engine v0.12.10

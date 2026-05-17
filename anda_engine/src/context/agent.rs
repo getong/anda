@@ -1221,6 +1221,7 @@ impl CompletionRunner {
     }
 
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
+        let mut pending_tool_calls = false;
         if !self.pending_tool_calls.is_empty()
             && let Some(content) = self.drain_steering_message()
         {
@@ -1235,6 +1236,7 @@ impl CompletionRunner {
             // 自动执行工具/代理调用
             let tool_calls = std::mem::take(&mut self.pending_tool_calls);
             if !tool_calls.is_empty() {
+                pending_tool_calls = true;
                 let mut tool_call_futs: Vec<BoxPinFut<(Option<ToolCall>, Option<String>)>> =
                     Vec::new();
                 for mut tool in tool_calls.into_iter() {
@@ -1392,7 +1394,7 @@ impl CompletionRunner {
 
         self.turns += 1;
         let mut req = self.req.clone();
-        if let Some(implicit_context) = self.implicit_context.take() {
+        if !pending_tool_calls && let Some(implicit_context) = self.implicit_context.take() {
             req.chat_history.push(implicit_context);
         }
 

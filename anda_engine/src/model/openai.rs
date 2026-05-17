@@ -1108,11 +1108,13 @@ impl CompletionFeaturesDyn for CompletionModel {
                     .into_iter()
                     .map(ToolDefinition::from)
                     .collect::<Vec<_>>();
-                r.tool_choice = Some(if req.tool_choice_required {
-                    ChatCompletionToolChoice::Mode(ChatCompletionToolChoiceMode::Required)
-                } else {
-                    ChatCompletionToolChoice::Mode(ChatCompletionToolChoiceMode::Auto)
-                });
+                if !r.model.starts_with("deepseek") {
+                    r.tool_choice = Some(if req.tool_choice_required {
+                        ChatCompletionToolChoice::Mode(ChatCompletionToolChoiceMode::Required)
+                    } else {
+                        ChatCompletionToolChoice::Mode(ChatCompletionToolChoiceMode::Auto)
+                    });
+                }
             };
 
             if log_enabled!(Debug)
